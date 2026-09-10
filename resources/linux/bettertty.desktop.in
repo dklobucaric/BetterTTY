@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=BetterTTY
+Comment=A better way to SSH
+Exec=bettertty
+Icon=bettertty
+Terminal=false
+Categories=Network;RemoteAccess;FileTransfer;Qt;
+Keywords=SSH;SFTP;terminal;remote;server;
+StartupNotify=true

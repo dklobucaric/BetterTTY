@@ -1,0 +1,3198 @@
+#include "MainWindow.h"
+#include "ConnectDialog.h"
+#include "BasicTerminalTab.h"
+#include "WebTerminalTab.h"
+#include "SettingsDialog.h"
+#include "SftpBrowserTab.h"
+#include "core/AppLogger.h"
+#include "core/ConfigManager.h"
+#include "core/KnownHostsManager.h"
+#include "core/SessionProfile.h"
+#include "ssh/SshSession.h"
+
+#include <QAbstractButton>
+#include <QAction>
+#include <QApplication>
+#include <QCoreApplication>
+#include <QCloseEvent>
+#include <QDateTime>
+#include <QDesktopServices>
+#include <QFile>
+#include <QFileDevice>
+#include <QFileDialog>
+#include <QFontDatabase>
+#include <QLabel>
+#include <QListWidget>
+#include <QListWidgetItem>
+#include <QMenuBar>
+#include <QMessageBox>
+#include <QMenu>
+#include <QDir>
+#include <QPushButton>
+#include <QSplitter>
+#include <QStatusBar>
+#include <QSysInfo>
+#include <QTabWidget>
+#include <QTabBar>
+#include <QStringList>
+#include <QTemporaryFile>
+#include <QTextEdit>
+#include <QToolBar>
+#include <QTimer>
+#include <QUrl>
+
+#ifndef BETTERTTY_CODENAME_STRING
+#define BETTERTTY_CODENAME_STRING "unnamed"
+#endif
+
+#ifndef BETTERTTY_MILESTONE_STRING
+#define BETTERTTY_MILESTONE_STRING "development"
+#endif
+
+
+namespace {
+QString normalizedAppTheme(const QString &themeName)
+{
+    const QString normalized = themeName.trimmed().toLower();
+
+    if (normalized == QStringLiteral("light") || normalized == QStringLiteral("dark")) {
+        return normalized;
+    }
+
+    return QStringLiteral("system");
+}
+
+QString formatTrafficBytes(qint64 bytes)
+{
+    if (bytes < 0) {
+        bytes = 0;
+    }
+
+    const double value = static_cast<double>(bytes);
+
+    if (bytes < 1024) {
+        return QString::number(bytes) + QStringLiteral(" B");
+    }
+
+    if (bytes < 1024LL * 1024LL) {
+        return QString::number(value / 1024.0, 'f', 1) + QStringLiteral(" KB");
+    }
+
+    if (bytes < 1024LL * 1024LL * 1024LL) {
+        return QString::number(value / (1024.0 * 1024.0), 'f', 1) + QStringLiteral(" MB");
+    }
+
+    return QString::number(value / (1024.0 * 1024.0 * 1024.0), 'f', 1) + QStringLiteral(" GB");
+}
+
+QString formatTrafficRate(qint64 bytesPerSecond)
+{
+    return formatTrafficBytes(bytesPerSecond) + QStringLiteral("/s");
+}
+
+
+QString yesNo(bool value)
+{
+    return value ? QStringLiteral("YES") : QStringLiteral("NO");
+}
+
+QString formatConfigPreviewBytes(qint64 bytes)
+{
+    return formatTrafficBytes(bytes);
+}
+
+QString formatConfigPreviewDetails(const ConfigPreview &preview, const QString &pathLabel)
+{
+    QString details;
+    details += QStringLiteral("%1: %2\n").arg(pathLabel, preview.filePath);
+    details += QStringLiteral("File size: %1\n").arg(formatConfigPreviewBytes(preview.fileSizeBytes));
+    details += QStringLiteral("Valid JSON object: %1\n").arg(yesNo(preview.validJson && preview.isObject && !preview.hasProblem));
+
+    if (!preview.configVersion.trimmed().isEmpty()) {
+        details += QStringLiteral("Config version: %1\n").arg(preview.configVersion.trimmed());
+    } else {
+        details += QStringLiteral("Config version: <not declared>\n");
+    }
+
+    details += QStringLiteral("Sessions: %1\n").arg(preview.sessionCount);
+    details += QStringLiteral("Known hosts: %1 host(s), %2 trusted key(s)\n")
+        .arg(preview.knownHostCount)
+        .arg(preview.knownHostKeyCount);
+    details += QStringLiteral("Secrets mode: %1\n").arg(preview.secretsMode.trimmed().isEmpty() ? QStringLiteral("<missing>") : preview.secretsMode.trimmed());
+    details += QStringLiteral("Saved secrets: %1 total (%2 password, %3 private key)\n")
+        .arg(preview.secretCount)
+        .arg(preview.passwordSecretCount)
+        .arg(preview.privateKeySecretCount);
+    details += QStringLiteral("Contains plaintext secret values: %1\n").arg(yesNo(preview.containsPlainSecrets));
+    details += QStringLiteral("Settings section: %1\n").arg(preview.hasSettings ? QStringLiteral("present") : QStringLiteral("missing/invalid"));
+    details += QStringLiteral("Metadata section: %1").arg(preview.hasMetadata ? QStringLiteral("present") : QStringLiteral("missing/invalid"));
+
+    if (!preview.warnings.isEmpty()) {
+        details += QStringLiteral("\n\nWarnings:\n");
+        for (const QString &warning : preview.warnings) {
+            details += QStringLiteral("- ") + warning + QStringLiteral("\n");
+        }
+        details = details.trimmed();
+    }
+
+    return details;
+}
+
+QString formatConfigPreviewLogSummary(const ConfigPreview &preview)
+{
+    return QStringLiteral("sessions=%1, known_hosts=%2, known_host_keys=%3, secrets_mode=%4, secrets=%5, password_secrets=%6, private_key_secrets=%7, plaintext_secrets=%8")
+        .arg(preview.sessionCount)
+        .arg(preview.knownHostCount)
+        .arg(preview.knownHostKeyCount)
+        .arg(preview.secretsMode.trimmed().isEmpty() ? QStringLiteral("<missing>") : preview.secretsMode.trimmed())
+        .arg(preview.secretCount)
+        .arg(preview.passwordSecretCount)
+        .arg(preview.privateKeySecretCount)
+        .arg(yesNo(preview.containsPlainSecrets));
+}
+
+QString lightAppStyleSheet()
+{
+    return QStringLiteral(R"BETTERTTY(
+QMainWindow,
+QDialog,
+QMessageBox,
+QWidget {
+    background-color: #f6f7f9;
+    color: #202124;
+}
+QMenuBar,
+QMenu,
+QToolBar,
+QStatusBar {
+    background-color: #ffffff;
+    color: #202124;
+}
+QMenuBar::item:selected,
+QMenu::item:selected {
+    background-color: #e8f0fe;
+}
+QSplitter::handle {
+    background-color: #d0d5dd;
+}
+QGroupBox {
+    border: 1px solid #cfd4dc;
+    border-radius: 4px;
+    margin-top: 8px;
+    padding-top: 12px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+}
+QLineEdit,
+QSpinBox,
+QComboBox,
+QListWidget,
+QTableWidget,
+QTableView,
+QTreeView,
+QTextEdit,
+QPlainTextEdit {
+    background-color: #ffffff;
+    color: #202124;
+    border: 1px solid #b8c0cc;
+    selection-background-color: #cfe3ff;
+    selection-color: #111111;
+}
+QTableWidget::item:selected,
+QTreeView::item:selected {
+    background-color: #cfe3ff;
+    color: #111111;
+}
+QPushButton {
+    background-color: #ffffff;
+    color: #202124;
+    border: 1px solid #aab2c0;
+    border-radius: 4px;
+    padding: 4px 10px;
+}
+QPushButton:hover {
+    background-color: #eef4ff;
+}
+QPushButton:disabled {
+    color: #8a8f98;
+    background-color: #f1f3f5;
+}
+QTabWidget::pane {
+    border: 1px solid #cfd4dc;
+}
+QTabBar::tab {
+    background-color: #edf1f5;
+    color: #202124;
+    border: 1px solid #cfd4dc;
+    padding: 5px 10px;
+}
+QTabBar::tab:selected {
+    background-color: #ffffff;
+}
+)BETTERTTY");
+}
+
+QString darkAppStyleSheet()
+{
+    return QStringLiteral(R"BETTERTTY(
+QMainWindow,
+QDialog,
+QMessageBox,
+QWidget {
+    background-color: #1f232a;
+    color: #e6edf3;
+}
+QMenuBar,
+QMenu,
+QToolBar,
+QStatusBar {
+    background-color: #151922;
+    color: #e6edf3;
+}
+QMenuBar::item:selected,
+QMenu::item:selected {
+    background-color: #263449;
+}
+QSplitter::handle {
+    background-color: #303846;
+}
+QGroupBox {
+    border: 1px solid #3a4354;
+    border-radius: 4px;
+    margin-top: 8px;
+    padding-top: 12px;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 8px;
+    padding: 0 4px;
+}
+QLabel {
+    color: #e6edf3;
+}
+QLineEdit,
+QSpinBox,
+QComboBox,
+QListWidget,
+QTableWidget,
+QTableView,
+QTreeView,
+QTextEdit,
+QPlainTextEdit {
+    background-color: #0f141b;
+    color: #e6edf3;
+    border: 1px solid #3a4354;
+    selection-background-color: #315f9f;
+    selection-color: #ffffff;
+}
+QListWidget::item:selected,
+QTableWidget::item:selected,
+QTreeView::item:selected {
+    background-color: #2f7d46;
+    color: #ffffff;
+}
+QTableWidget::item,
+QTreeView::item {
+    background-color: #0f141b;
+    color: #e6edf3;
+}
+QPushButton {
+    background-color: #26303d;
+    color: #e6edf3;
+    border: 1px solid #536174;
+    border-radius: 4px;
+    padding: 4px 10px;
+}
+QPushButton:hover {
+    background-color: #334155;
+}
+QPushButton:disabled {
+    color: #7d8794;
+    background-color: #202631;
+}
+QTabWidget::pane {
+    border: 1px solid #3a4354;
+}
+QTabBar::tab {
+    background-color: #202631;
+    color: #d8dee9;
+    border: 1px solid #3a4354;
+    padding: 5px 10px;
+}
+QTabBar::tab:selected {
+    background-color: #111827;
+    color: #ffffff;
+}
+)BETTERTTY");
+}
+
+struct KnownHostDecisionResult
+{
+    bool allowed = false;
+    QString decision = QStringLiteral("Not checked");
+    QString extra;
+};
+
+QString hostPortLabel(const QString &host, int port)
+{
+    return host + QStringLiteral(":") + QString::number(port);
+}
+
+SshHostKeyExpectation makeHostKeyExpectation(
+    const QString &host,
+    int port,
+    const QString &keyType,
+    const QString &fingerprint,
+    const QString &decision
+)
+{
+    SshHostKeyExpectation expectation;
+    expectation.enabled = true;
+    expectation.host = host;
+    expectation.port = port;
+    expectation.keyType = keyType;
+    expectation.fingerprint = fingerprint;
+    expectation.decision = decision;
+    return expectation;
+}
+
+KnownHostDecisionResult promptKnownHostDecision(
+    QWidget *parent,
+    KnownHostsManager &knownHosts,
+    const KnownHostsManager::CheckResult &check,
+    const QString &host,
+    int port,
+    const QString &currentKeyType,
+    const QString &currentFingerprint,
+    bool beforeOpeningShell
+)
+{
+    KnownHostDecisionResult result;
+
+    if (check.status == KnownHostsManager::HostStatus::Trusted) {
+        result.allowed = true;
+        result.decision = QStringLiteral("TRUSTED - stored fingerprint matches current host key");
+
+        QString saveError;
+        knownHosts.trustHost(host, port, currentKeyType, currentFingerprint, &saveError);
+
+        if (!saveError.isEmpty()) {
+            result.extra = QStringLiteral("Warning while updating last_seen: ") + saveError;
+        }
+
+        return result;
+    }
+
+    if (check.status == KnownHostsManager::HostStatus::Unknown) {
+        QMessageBox messageBox(parent);
+        messageBox.setIcon(QMessageBox::Warning);
+        messageBox.setWindowTitle(QStringLiteral("Unknown SSH host"));
+        messageBox.setText(QStringLiteral("This SSH host is not trusted yet."));
+        messageBox.setInformativeText(
+            QStringLiteral("Host: ") + hostPortLabel(host, port) + QStringLiteral("\n")
+            + QStringLiteral("Key type: ") + currentKeyType + QStringLiteral("\n")
+            + QStringLiteral("Fingerprint: ") + currentFingerprint + QStringLiteral("\n\n")
+            + (beforeOpeningShell
+                ? QStringLiteral("Do you want to trust this host before opening a shell?")
+                : QStringLiteral("Do you want to trust this host?"))
+        );
+
+        QAbstractButton *trustOnceButton = messageBox.addButton(QStringLiteral("Trust once"), QMessageBox::AcceptRole);
+        QAbstractButton *trustPermanentlyButton = messageBox.addButton(QStringLiteral("Trust permanently"), QMessageBox::AcceptRole);
+        QAbstractButton *cancelButton = messageBox.addButton(QStringLiteral("Cancel"), QMessageBox::RejectRole);
+
+        messageBox.setDefaultButton(qobject_cast<QPushButton *>(cancelButton));
+        messageBox.exec();
+
+        if (messageBox.clickedButton() == trustOnceButton) {
+            result.allowed = true;
+            result.decision = QStringLiteral("UNKNOWN - trusted once only");
+        } else if (messageBox.clickedButton() == trustPermanentlyButton) {
+            QString saveError;
+
+            if (knownHosts.trustHost(host, port, currentKeyType, currentFingerprint, &saveError)) {
+                result.allowed = true;
+                result.decision = QStringLiteral("UNKNOWN - trusted permanently and saved to config");
+            } else {
+                result.allowed = false;
+                result.decision = QStringLiteral("UNKNOWN - could not save trusted host");
+                result.extra = saveError;
+
+                QMessageBox::warning(parent, QStringLiteral("Could not save known host"), saveError);
+            }
+        } else {
+            result.allowed = false;
+            result.decision = QStringLiteral("UNKNOWN - cancelled by user");
+        }
+
+        return result;
+    }
+
+    if (check.status == KnownHostsManager::HostStatus::AdditionalKeyType) {
+        QMessageBox messageBox(parent);
+        messageBox.setIcon(QMessageBox::Warning);
+        messageBox.setWindowTitle(QStringLiteral("Additional SSH host key"));
+        messageBox.setText(QStringLiteral("This host is trusted, but this key type is not saved yet."));
+        messageBox.setInformativeText(
+            QStringLiteral("Host: ") + hostPortLabel(host, port) + QStringLiteral("\n\n")
+            + QStringLiteral("Saved host keys:\n") + check.storedKeysSummary + QStringLiteral("\n\n")
+            + QStringLiteral("Current key type: ") + currentKeyType + QStringLiteral("\n")
+            + QStringLiteral("Current fingerprint: ") + currentFingerprint + QStringLiteral("\n\n")
+            + QStringLiteral("If you verified this fingerprint belongs to the same server, save it as an additional trusted key. This keeps one portable BetterTTY.json working across platforms that negotiate different SSH host-key algorithms.")
+        );
+
+        QAbstractButton *trustOnceButton = messageBox.addButton(QStringLiteral("Trust once"), QMessageBox::AcceptRole);
+        QAbstractButton *trustAdditionalButton = messageBox.addButton(QStringLiteral("Trust additional key"), QMessageBox::AcceptRole);
+        QAbstractButton *cancelButton = messageBox.addButton(QStringLiteral("Cancel"), QMessageBox::RejectRole);
+
+        messageBox.setDefaultButton(qobject_cast<QPushButton *>(cancelButton));
+        messageBox.exec();
+
+        if (messageBox.clickedButton() == trustOnceButton) {
+            result.allowed = true;
+            result.decision = QStringLiteral("ADDITIONAL KEY - trusted once only");
+        } else if (messageBox.clickedButton() == trustAdditionalButton) {
+            QString saveError;
+
+            if (knownHosts.trustHost(host, port, currentKeyType, currentFingerprint, &saveError)) {
+                result.allowed = true;
+                result.decision = QStringLiteral("ADDITIONAL KEY - trusted additional key type and saved to config");
+            } else {
+                result.allowed = false;
+                result.decision = QStringLiteral("ADDITIONAL KEY - could not save additional key type");
+                result.extra = saveError;
+
+                QMessageBox::warning(parent, QStringLiteral("Could not save additional known-host key"), saveError);
+            }
+        } else {
+            result.allowed = false;
+            result.decision = QStringLiteral("ADDITIONAL KEY - cancelled by user");
+        }
+
+        return result;
+    }
+
+    QMessageBox messageBox(parent);
+    messageBox.setIcon(QMessageBox::Critical);
+    messageBox.setWindowTitle(QStringLiteral("SSH host key changed"));
+    messageBox.setText(QStringLiteral("WARNING: The stored SSH host key does not match the current server key."));
+    messageBox.setInformativeText(
+        QStringLiteral("Host: ") + hostPortLabel(host, port) + QStringLiteral("\n\n")
+        + QStringLiteral("Stored key type: ") + check.storedKeyType + QStringLiteral("\n")
+        + QStringLiteral("Stored fingerprint: ") + check.storedFingerprint + QStringLiteral("\n\n")
+        + QStringLiteral("Current key type: ") + currentKeyType + QStringLiteral("\n")
+        + QStringLiteral("Current fingerprint: ") + currentFingerprint + QStringLiteral("\n\n")
+        + QStringLiteral("This may mean the server was reinstalled, DNS/IP changed, or a man-in-the-middle attack is possible.")
+    );
+
+    QAbstractButton *replaceButton = messageBox.addButton(QStringLiteral("Replace stored key"), QMessageBox::DestructiveRole);
+    QAbstractButton *trustOnceButton = messageBox.addButton(QStringLiteral("Trust once"), QMessageBox::AcceptRole);
+    QAbstractButton *cancelButton = messageBox.addButton(QStringLiteral("Cancel"), QMessageBox::RejectRole);
+
+    messageBox.setDefaultButton(qobject_cast<QPushButton *>(cancelButton));
+    messageBox.exec();
+
+    if (messageBox.clickedButton() == replaceButton) {
+        QString saveError;
+
+        if (knownHosts.trustHost(host, port, currentKeyType, currentFingerprint, &saveError)) {
+            result.allowed = true;
+            result.decision = QStringLiteral("CHANGED - stored key replaced by user");
+        } else {
+            result.allowed = false;
+            result.decision = QStringLiteral("CHANGED - could not replace stored key");
+            result.extra = saveError;
+
+            QMessageBox::warning(parent, QStringLiteral("Could not replace known host"), saveError);
+        }
+    } else if (messageBox.clickedButton() == trustOnceButton) {
+        result.allowed = true;
+        result.decision = QStringLiteral("CHANGED - trusted once only");
+    } else {
+        result.allowed = false;
+        result.decision = QStringLiteral("CHANGED - cancelled by user");
+    }
+
+    return result;
+}
+}
+
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent)
+{
+    setWindowTitle("BetterTTY");
+
+    ConfigManager config;
+    QString settingsError;
+    const AppSettings startupSettings = config.loadSettings(&settingsError);
+
+    if (settingsError.isEmpty()) {
+        AppLogger::setEnabled(startupSettings.diagnosticLoggingEnabled);
+        AppLogger::info(QStringLiteral("App started"));
+        AppLogger::info(QStringLiteral("Version: ") + QCoreApplication::applicationVersion());
+        AppLogger::info(QStringLiteral("OS: ") + QSysInfo::prettyProductName());
+        AppLogger::info(QStringLiteral("Qt: ") + QString::fromLatin1(qVersion()));
+        AppLogger::info(QStringLiteral("libssh: ") + SshSession::libsshVersion());
+        AppLogger::info(QStringLiteral("Config file: ") + config.configFilePath());
+        AppLogger::info(QStringLiteral("Log folder: ") + AppLogger::logDirectoryPath());
+        applyAppTheme(startupSettings.appTheme);
+    }
+
+    setupMenus();
+    setupToolbar();
+    applyQuickToolbarVisibility(startupSettings.showQuickToolbar);
+    setupCentralLayout();
+    setupTrafficStatusIndicator();
+    updateLoggingStatusIndicator();
+
+    statusBar()->showMessage("BetterTTY Andromeda ready — exit safety enabled");
+
+    resize(1100, 700);
+    showConfigRecoveryWarningIfNeeded();
+}
+
+void MainWindow::applyAppTheme(const QString &themeName)
+{
+    const QString normalized = normalizedAppTheme(themeName);
+
+    if (normalized == QStringLiteral("dark")) {
+        qApp->setStyleSheet(darkAppStyleSheet());
+        return;
+    }
+
+    if (normalized == QStringLiteral("light")) {
+        qApp->setStyleSheet(lightAppStyleSheet());
+        return;
+    }
+
+    qApp->setStyleSheet(QString());
+}
+
+void MainWindow::applyQuickToolbarVisibility(bool showQuickToolbar)
+{
+    if (m_mainToolBar == nullptr) {
+        return;
+    }
+
+    m_mainToolBar->setVisible(showQuickToolbar);
+}
+
+void MainWindow::openConfigFolder()
+{
+    ConfigManager config;
+    QDir directory(config.configDirectoryPath());
+
+    if (!directory.exists()) {
+        directory.mkpath(QStringLiteral("."));
+    }
+
+    AppLogger::info(QStringLiteral("Opening config folder: ") + directory.absolutePath());
+    QDesktopServices::openUrl(QUrl::fromLocalFile(directory.absolutePath()));
+}
+
+void MainWindow::openLogFolder()
+{
+    QString errorMessage;
+
+    if (!AppLogger::ensureLogDirectory(&errorMessage)) {
+        QMessageBox::warning(
+            this,
+            QStringLiteral("Could not open log folder"),
+            errorMessage
+        );
+        statusBar()->showMessage(QStringLiteral("Could not open log folder"));
+        return;
+    }
+
+    AppLogger::info(QStringLiteral("Opening log folder: ") + AppLogger::logDirectoryPath());
+    QDesktopServices::openUrl(QUrl::fromLocalFile(AppLogger::logDirectoryPath()));
+    statusBar()->showMessage(QStringLiteral("Opened BetterTTY log folder"));
+}
+
+void MainWindow::setupTrafficStatusIndicator()
+{
+    if (m_trafficStatusLabel == nullptr) {
+        m_trafficStatusLabel = new QLabel(this);
+        m_trafficStatusLabel->setText(QStringLiteral("Traffic: No active session"));
+        m_trafficStatusLabel->setToolTip(QStringLiteral("Live BetterTTY session traffic for the active terminal or File Manager tab. This is application SSH/SFTP traffic, not global OS network usage."));
+        statusBar()->addPermanentWidget(m_trafficStatusLabel);
+    }
+
+    if (m_trafficUpdateTimer == nullptr) {
+        m_trafficUpdateTimer = new QTimer(this);
+        m_trafficUpdateTimer->setInterval(1000);
+        connect(m_trafficUpdateTimer, &QTimer::timeout, this, [this]() {
+            updateTrafficStatusIndicator();
+        });
+        m_trafficUpdateTimer->start();
+    }
+
+    updateTrafficStatusIndicator();
+}
+
+void MainWindow::updateTrafficStatusIndicator()
+{
+    if (m_trafficStatusLabel == nullptr) {
+        return;
+    }
+
+    QWidget *currentWidget = m_tabs != nullptr ? m_tabs->currentWidget() : nullptr;
+
+    QString sessionName;
+    qint64 receivedBytes = 0;
+    qint64 sentBytes = 0;
+    bool trafficCapableTab = false;
+    bool activeTransferOrShell = false;
+
+    if (auto *webTerminal = dynamic_cast<WebTerminalTab *>(currentWidget)) {
+        trafficCapableTab = true;
+        activeTransferOrShell = webTerminal->hasActiveShell();
+        sessionName = webTerminal->trafficSessionName();
+        receivedBytes = webTerminal->receivedBytesTotal();
+        sentBytes = webTerminal->sentBytesTotal();
+    } else if (auto *basicTerminal = dynamic_cast<BasicTerminalTab *>(currentWidget)) {
+        trafficCapableTab = true;
+        activeTransferOrShell = basicTerminal->hasActiveShell();
+        sessionName = basicTerminal->trafficSessionName();
+        receivedBytes = basicTerminal->receivedBytesTotal();
+        sentBytes = basicTerminal->sentBytesTotal();
+    } else if (auto *sftpBrowser = dynamic_cast<SftpBrowserTab *>(currentWidget)) {
+        trafficCapableTab = true;
+        activeTransferOrShell = sftpBrowser->hasActiveSftpTransfer();
+        sessionName = sftpBrowser->trafficSessionName();
+        receivedBytes = sftpBrowser->receivedBytesTotal();
+        sentBytes = sftpBrowser->sentBytesTotal();
+    }
+
+    if (!trafficCapableTab) {
+        m_trafficStatusLabel->setText(QStringLiteral("Traffic: No active session"));
+        m_lastTrafficWidget = nullptr;
+        m_lastTrafficReceivedBytes = 0;
+        m_lastTrafficSentBytes = 0;
+        m_lastTrafficUpdateMs = QDateTime::currentMSecsSinceEpoch();
+        return;
+    }
+
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    qint64 receivedRate = 0;
+    qint64 sentRate = 0;
+
+    if (currentWidget == m_lastTrafficWidget && m_lastTrafficUpdateMs > 0 && nowMs > m_lastTrafficUpdateMs) {
+        const qint64 elapsedMs = nowMs - m_lastTrafficUpdateMs;
+        receivedRate = ((receivedBytes - m_lastTrafficReceivedBytes) * 1000) / elapsedMs;
+        sentRate = ((sentBytes - m_lastTrafficSentBytes) * 1000) / elapsedMs;
+
+        if (receivedRate < 0) {
+            receivedRate = 0;
+        }
+
+        if (sentRate < 0) {
+            sentRate = 0;
+        }
+    }
+
+    m_lastTrafficWidget = currentWidget;
+    m_lastTrafficReceivedBytes = receivedBytes;
+    m_lastTrafficSentBytes = sentBytes;
+    m_lastTrafficUpdateMs = nowMs;
+
+    const QString normalizedSessionName = sessionName.trimmed().isEmpty()
+        ? QStringLiteral("unnamed")
+        : sessionName.trimmed();
+
+    const QString stateSuffix = activeTransferOrShell ? QString() : QStringLiteral(" idle");
+
+    m_trafficStatusLabel->setText(
+        QStringLiteral("Traffic: %1%2 ↓ %3 ↑ %4 | Total ↓ %5 ↑ %6")
+            .arg(
+                normalizedSessionName,
+                stateSuffix,
+                formatTrafficRate(receivedRate),
+                formatTrafficRate(sentRate),
+                formatTrafficBytes(receivedBytes),
+                formatTrafficBytes(sentBytes)
+            )
+    );
+}
+
+void MainWindow::updateLoggingStatusIndicator()
+{
+    if (m_loggingStatusLabel == nullptr) {
+        m_loggingStatusLabel = new QLabel(this);
+        m_loggingStatusLabel->setText(QStringLiteral("Logging enabled"));
+        m_loggingStatusLabel->setToolTip(QStringLiteral("Diagnostic logging is enabled. Use Help → Open Log Folder to view log files."));
+        statusBar()->addPermanentWidget(m_loggingStatusLabel);
+    }
+
+    m_loggingStatusLabel->setVisible(AppLogger::isEnabled());
+}
+
+
+void MainWindow::exportConfig()
+{
+    ConfigManager config;
+
+    const ConfigPreview preview = config.previewConfigFile(config.configFilePath());
+
+    if (preview.hasProblem) {
+        AppLogger::error(QStringLiteral("Config export preview failed: ") + preview.errorMessage);
+        QMessageBox::critical(
+            this,
+            QStringLiteral("Export config failed — BetterTTY"),
+            QStringLiteral("The active BetterTTY.json cannot be previewed/exported safely.\n\n%1").arg(preview.errorMessage)
+        );
+        statusBar()->showMessage(QStringLiteral("Config export failed"));
+        return;
+    }
+
+    AppLogger::info(QStringLiteral("Config export preview: ") + formatConfigPreviewLogSummary(preview));
+
+    const QMessageBox::StandardButton exportDecision = QMessageBox::warning(
+        this,
+        QStringLiteral("Export config preview — BetterTTY"),
+        QStringLiteral(
+            "BetterTTY is about to export the active human-readable BetterTTY.json.\n\n"
+            "%1\n\n"
+            "Security note:\n"
+            "This export may include saved sessions, known hosts, settings, and plain-v1 secrets. "
+            "If plaintext password/private-key values are present, treat the exported JSON file as sensitive.\n\n"
+            "Continue?"
+        ).arg(formatConfigPreviewDetails(preview, QStringLiteral("Active config"))),
+        QMessageBox::Yes | QMessageBox::Cancel,
+        QMessageBox::Cancel
+    );
+
+    if (exportDecision != QMessageBox::Yes) {
+        AppLogger::info(QStringLiteral("Config export cancelled after preview"));
+        statusBar()->showMessage(QStringLiteral("Config export cancelled"));
+        return;
+    }
+
+    QString defaultFileName = QDir::home().filePath(QStringLiteral("bettertty-export.json"));
+    const QString targetPath = QFileDialog::getSaveFileName(
+        this,
+        QStringLiteral("Export BetterTTY config"),
+        defaultFileName,
+        QStringLiteral("JSON files (*.json);;All files (*)")
+    );
+
+    if (targetPath.trimmed().isEmpty()) {
+        AppLogger::info(QStringLiteral("Config export cancelled before selecting target"));
+        return;
+    }
+
+    QString errorMessage;
+
+    AppLogger::info(QStringLiteral("Config export requested: target=") + targetPath);
+
+    if (!config.exportConfigToFile(targetPath, &errorMessage)) {
+        AppLogger::error(QStringLiteral("Config export failed: ") + errorMessage);
+        QMessageBox::critical(
+            this,
+            QStringLiteral("Export config failed — BetterTTY"),
+            errorMessage
+        );
+        statusBar()->showMessage(QStringLiteral("Config export failed"));
+        return;
+    }
+
+    AppLogger::info(QStringLiteral("Config export successful: target=") + targetPath);
+
+    QMessageBox::information(
+        this,
+        QStringLiteral("Config exported — BetterTTY"),
+        QStringLiteral("BetterTTY config was exported to:\n%1\n\nSecurity note: exported configs may contain plaintext passwords and private keys.")
+            .arg(targetPath)
+    );
+    statusBar()->showMessage(QStringLiteral("Config exported to %1").arg(targetPath));
+}
+
+void MainWindow::importConfig()
+{
+    ConfigManager config;
+
+    const QString sourcePath = QFileDialog::getOpenFileName(
+        this,
+        QStringLiteral("Import BetterTTY config"),
+        QDir::homePath(),
+        QStringLiteral("JSON files (*.json);;All files (*)")
+    );
+
+    if (sourcePath.trimmed().isEmpty()) {
+        AppLogger::info(QStringLiteral("Config import cancelled before selecting file"));
+        return;
+    }
+
+    const ConfigPreview preview = config.previewConfigFile(sourcePath);
+
+    if (preview.hasProblem) {
+        AppLogger::error(QStringLiteral("Config import preview failed: ") + preview.errorMessage);
+        QMessageBox::critical(
+            this,
+            QStringLiteral("Import config failed — BetterTTY"),
+            QStringLiteral("The selected file cannot be imported because it failed the preview check.\n\n%1").arg(preview.errorMessage)
+        );
+        statusBar()->showMessage(QStringLiteral("Config import failed"));
+        return;
+    }
+
+    AppLogger::info(QStringLiteral("Config import preview: ") + formatConfigPreviewLogSummary(preview));
+
+    QMessageBox importBox(QMessageBox::Warning,
+        QStringLiteral("Import config preview — BetterTTY"),
+        QStringLiteral(
+            "Importing this config will replace the active BetterTTY.json.\n\n"
+            "%1\n\n"
+            "BetterTTY will create a pre-import backup of the current config before replacing it.\n\n"
+            "Security note:\n"
+            "Only import configs from trusted sources. This file may contain plaintext saved passwords or private keys.\n\n"
+            "Continue?"
+        ).arg(formatConfigPreviewDetails(preview, QStringLiteral("Import file"))),
+        QMessageBox::NoButton,
+        this
+    );
+    QPushButton *importButton = importBox.addButton(QStringLiteral("Import"), QMessageBox::AcceptRole);
+    QPushButton *cancelImportButton = importBox.addButton(QMessageBox::Cancel);
+    importBox.setDefaultButton(cancelImportButton);
+    importBox.exec();
+
+    if (importBox.clickedButton() != importButton) {
+        AppLogger::info(QStringLiteral("Config import cancelled after preview: source=") + sourcePath);
+        statusBar()->showMessage(QStringLiteral("Config import cancelled"));
+        return;
+    }
+
+    QString errorMessage;
+    QString backupPath;
+
+    AppLogger::info(QStringLiteral("Config import requested: source=") + sourcePath);
+
+    if (!config.importConfigFromFile(sourcePath, &errorMessage, &backupPath)) {
+        AppLogger::error(QStringLiteral("Config import failed: ") + errorMessage);
+        QMessageBox::critical(
+            this,
+            QStringLiteral("Import config failed — BetterTTY"),
+            errorMessage
+        );
+        statusBar()->showMessage(QStringLiteral("Config import failed"));
+        return;
+    }
+
+    QString info = QStringLiteral("BetterTTY config was imported from:\n%1").arg(sourcePath);
+
+    if (!backupPath.isEmpty()) {
+        info += QStringLiteral("\n\nPrevious config backup created at:\n%1").arg(backupPath);
+    }
+
+    AppLogger::info(QStringLiteral("Config import successful: source=") + sourcePath);
+
+    QMessageBox::information(
+        this,
+        QStringLiteral("Config imported — BetterTTY"),
+        info
+    );
+
+    QString settingsError;
+    const AppSettings settings = config.loadSettings(&settingsError);
+
+    if (settingsError.isEmpty()) {
+        applyAppTheme(settings.appTheme);
+        applyQuickToolbarVisibility(settings.showQuickToolbar);
+        AppLogger::setEnabled(settings.diagnosticLoggingEnabled);
+        updateLoggingStatusIndicator();
+        AppLogger::info(QStringLiteral("Settings reloaded after config import"));
+    }
+
+    loadSavedSessionsToSidebar();
+    statusBar()->showMessage(QStringLiteral("Config imported. Saved sessions and settings reloaded."));
+}
+
+
+void MainWindow::restoreLatestConfigBackup()
+{
+    ConfigManager config;
+
+    QMessageBox restoreBox(QMessageBox::Warning,
+        QStringLiteral("Restore latest config backup — BetterTTY"),
+        QStringLiteral(
+            "This will replace the active BetterTTY.json with the newest valid BetterTTY.json.bak-* backup.\n\n"
+            "The current config will be moved aside first as BetterTTY.json.pre-restore-<timestamp>.\n\n"
+            "Continue?"
+        ),
+        QMessageBox::NoButton,
+        this
+    );
+    QPushButton *restoreButton = restoreBox.addButton(QStringLiteral("Restore"), QMessageBox::AcceptRole);
+    QPushButton *cancelRestoreButton = restoreBox.addButton(QMessageBox::Cancel);
+    restoreBox.setDefaultButton(cancelRestoreButton);
+    restoreBox.exec();
+
+    if (restoreBox.clickedButton() != restoreButton) {
+        statusBar()->showMessage(QStringLiteral("Config backup restore cancelled"));
+        return;
+    }
+
+    QString errorMessage;
+    QString restoredBackupName;
+    QString movedCurrentPath;
+
+    if (!config.restoreLatestBackupReplacingCurrent(&errorMessage, &restoredBackupName, &movedCurrentPath)) {
+        QMessageBox::critical(
+            this,
+            QStringLiteral("Restore backup failed — BetterTTY"),
+            errorMessage
+        );
+        statusBar()->showMessage(QStringLiteral("Config backup restore failed"));
+        return;
+    }
+
+    QString info = QStringLiteral("Restored latest valid backup:\n%1").arg(restoredBackupName);
+
+    if (!movedCurrentPath.isEmpty()) {
+        info += QStringLiteral("\n\nPrevious active config moved to:\n%1").arg(movedCurrentPath);
+    }
+
+    QMessageBox::information(
+        this,
+        QStringLiteral("Backup restored — BetterTTY"),
+        info
+    );
+
+    QString settingsError;
+    const AppSettings settings = config.loadSettings(&settingsError);
+
+    if (settingsError.isEmpty()) {
+        applyAppTheme(settings.appTheme);
+        applyQuickToolbarVisibility(settings.showQuickToolbar);
+        AppLogger::setEnabled(settings.diagnosticLoggingEnabled);
+        updateLoggingStatusIndicator();
+        AppLogger::info(QStringLiteral("Settings reloaded after config backup restore"));
+    }
+
+    loadSavedSessionsToSidebar();
+    statusBar()->showMessage(QStringLiteral("Latest config backup restored. Saved sessions and settings reloaded."));
+}
+
+
+QStringList MainWindow::activeSshTerminalNames() const
+{
+    QStringList names;
+
+    if (m_tabs == nullptr) {
+        return names;
+    }
+
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        QWidget *widget = m_tabs->widget(i);
+
+        if (auto *webTerminal = dynamic_cast<WebTerminalTab *>(widget)) {
+            if (webTerminal->hasActiveShell()) {
+                names.append(webTerminal->displayName());
+            }
+        } else if (auto *basicTerminal = dynamic_cast<BasicTerminalTab *>(widget)) {
+            if (basicTerminal->hasActiveShell()) {
+                names.append(basicTerminal->displayName());
+            }
+        }
+    }
+
+    return names;
+}
+
+QStringList MainWindow::openSftpBrowserNames() const
+{
+    QStringList names;
+
+    if (m_tabs == nullptr) {
+        return names;
+    }
+
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        QWidget *widget = m_tabs->widget(i);
+
+        if (auto *sftpBrowser = dynamic_cast<SftpBrowserTab *>(widget)) {
+            names.append(sftpBrowser->displayName());
+        }
+    }
+
+    return names;
+}
+
+QStringList MainWindow::activeSftpTransferQueueSummaries() const
+{
+    QStringList summaries;
+
+    if (m_tabs == nullptr) {
+        return summaries;
+    }
+
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        QWidget *widget = m_tabs->widget(i);
+
+        if (auto *sftpBrowser = dynamic_cast<SftpBrowserTab *>(widget)) {
+            if (sftpBrowser->hasTransferQueueWorkForExit()) {
+                summaries.append(sftpBrowser->transferQueueExitSummary());
+            }
+        }
+    }
+
+    return summaries;
+}
+
+bool MainWindow::confirmExitWithOpenConnectionTabs()
+{
+    const QStringList activeTerminals = activeSshTerminalNames();
+    const QStringList openSftpBrowsers = openSftpBrowserNames();
+    const QStringList activeQueues = activeSftpTransferQueueSummaries();
+
+    if (activeTerminals.isEmpty() && openSftpBrowsers.isEmpty() && activeQueues.isEmpty()) {
+        return true;
+    }
+
+    QString message = QStringLiteral("BetterTTY has open connection tab(s).\n\nClosing the application will close:");
+
+    const int maxShownItems = 10;
+
+    if (!activeTerminals.isEmpty()) {
+        message += QStringLiteral("\n\nSSH terminal session(s):");
+        for (int i = 0; i < activeTerminals.size() && i < maxShownItems; ++i) {
+            message += QStringLiteral("\n- ") + activeTerminals.at(i);
+        }
+        if (activeTerminals.size() > maxShownItems) {
+            message += QStringLiteral("\n- ...");
+        }
+    }
+
+    if (!openSftpBrowsers.isEmpty()) {
+        message += QStringLiteral("\n\nSFTP file manager tab(s):");
+        for (int i = 0; i < openSftpBrowsers.size() && i < maxShownItems; ++i) {
+            message += QStringLiteral("\n- ") + openSftpBrowsers.at(i);
+        }
+        if (openSftpBrowsers.size() > maxShownItems) {
+            message += QStringLiteral("\n- ...");
+        }
+    }
+
+    if (!activeQueues.isEmpty()) {
+        message += QStringLiteral("\n\nSFTP transfer queue work still present:");
+        for (int i = 0; i < activeQueues.size() && i < maxShownItems; ++i) {
+            message += QStringLiteral("\n- ") + activeQueues.at(i);
+        }
+        if (activeQueues.size() > maxShownItems) {
+            message += QStringLiteral("\n- ...");
+        }
+        message += QStringLiteral("\n\nWarning: closing while a queue is running or pending will stop/lose that queue state. Finished files stay on disk/server, but pending queue entries are not saved.");
+    }
+
+    message += QStringLiteral("\n\nClose these tabs and exit BetterTTY?");
+
+    QMessageBox dialog(this);
+    dialog.setIcon(QMessageBox::Warning);
+    dialog.setWindowTitle(QStringLiteral("Open connection tabs — BetterTTY"));
+    dialog.setText(message);
+
+    QPushButton *closeAndExitButton = dialog.addButton(
+        QStringLiteral("Close and Exit"),
+        QMessageBox::AcceptRole
+    );
+    QPushButton *cancelButton = dialog.addButton(
+        QStringLiteral("Cancel"),
+        QMessageBox::RejectRole
+    );
+
+    dialog.setDefaultButton(cancelButton);
+    dialog.exec();
+
+    return dialog.clickedButton() == closeAndExitButton;
+}
+
+void MainWindow::requestDisconnectForActiveSshTerminals()
+{
+    if (m_tabs == nullptr) {
+        return;
+    }
+
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        QWidget *widget = m_tabs->widget(i);
+
+        if (auto *webTerminal = dynamic_cast<WebTerminalTab *>(widget)) {
+            if (webTerminal->hasActiveShell()) {
+                webTerminal->requestDisconnect();
+            }
+        } else if (auto *basicTerminal = dynamic_cast<BasicTerminalTab *>(widget)) {
+            if (basicTerminal->hasActiveShell()) {
+                basicTerminal->requestDisconnect();
+            }
+        }
+    }
+}
+
+void MainWindow::closeEvent(QCloseEvent *event)
+{
+    AppLogger::info(QStringLiteral("App close requested"));
+
+    if (!confirmExitWithOpenConnectionTabs()) {
+        AppLogger::warn(QStringLiteral("App close cancelled because connection tabs are still open"));
+        statusBar()->showMessage(QStringLiteral("Exit cancelled because connection tabs are still open"));
+        event->ignore();
+        return;
+    }
+
+    requestDisconnectForActiveSshTerminals();
+    AppLogger::info(QStringLiteral("App closing"));
+    event->accept();
+}
+
+void MainWindow::showConfigRecoveryWarningIfNeeded()
+{
+    ConfigManager config;
+    const ConfigInspection inspection = config.inspectConfig();
+
+    if (!inspection.hasProblem) {
+        return;
+    }
+
+    showConfigRecoveryDialog(inspection);
+}
+
+bool MainWindow::showConfigRecoveryDialog(const ConfigInspection &inspection)
+{
+    QString details = inspection.message
+        + QStringLiteral("\n\nConfig file:\n")
+        + inspection.configFilePath
+        + QStringLiteral("\n\nBetterTTY will not overwrite this file automatically. You can continue read-only, restore the latest valid backup, or move the corrupt file aside and create a fresh empty config.");
+
+    if (!inspection.backupFileNames.isEmpty()) {
+        details += QStringLiteral("\n\nAvailable backups in the config folder:");
+
+        const int maxShownBackups = 10;
+
+        for (int i = 0; i < inspection.backupFileNames.size() && i < maxShownBackups; ++i) {
+            details += QStringLiteral("\n- ") + inspection.backupFileNames.at(i);
+        }
+
+        if (inspection.backupFileNames.size() > maxShownBackups) {
+            details += QStringLiteral("\n- ...");
+        }
+    } else {
+        details += QStringLiteral("\n\nNo BetterTTY.json.bak-* backup files were found in the config folder.");
+    }
+
+    QMessageBox messageBox(this);
+    messageBox.setIcon(QMessageBox::Warning);
+    messageBox.setWindowTitle(QStringLiteral("BetterTTY config recovery"));
+    messageBox.setText(inspection.title.isEmpty()
+        ? QStringLiteral("Config file problem detected")
+        : inspection.title);
+    messageBox.setInformativeText(details);
+
+    QAbstractButton *openFolderButton = messageBox.addButton(
+        QStringLiteral("Open config folder"),
+        QMessageBox::ActionRole
+    );
+    QAbstractButton *restoreButton = messageBox.addButton(
+        QStringLiteral("Restore latest valid backup"),
+        QMessageBox::ActionRole
+    );
+    QAbstractButton *freshConfigButton = messageBox.addButton(
+        QStringLiteral("Create fresh config"),
+        QMessageBox::DestructiveRole
+    );
+    QAbstractButton *continueButton = messageBox.addButton(
+        QStringLiteral("Continue read-only"),
+        QMessageBox::AcceptRole
+    );
+    messageBox.setDefaultButton(qobject_cast<QPushButton *>(continueButton));
+    messageBox.exec();
+
+    ConfigManager config;
+
+    if (messageBox.clickedButton() == openFolderButton) {
+        openConfigFolder();
+        statusBar()->showMessage(QStringLiteral("Opened config folder. Corrupt BetterTTY.json was not overwritten."));
+        return false;
+    }
+
+    if (messageBox.clickedButton() == restoreButton) {
+        QString error;
+        QString restoredBackupName;
+        QString movedCorruptPath;
+
+        if (!config.restoreLatestValidBackup(&error, &restoredBackupName, &movedCorruptPath)) {
+            QMessageBox::warning(
+                this,
+                QStringLiteral("Could not restore backup"),
+                error.isEmpty()
+                    ? QStringLiteral("BetterTTY could not restore the latest valid backup.")
+                    : error
+            );
+            statusBar()->showMessage(QStringLiteral("Config recovery failed: backup restore did not complete"));
+            return false;
+        }
+
+        loadSavedSessionsToSidebar();
+        QString settingsError;
+        const AppSettings restoredSettings = config.loadSettings(&settingsError);
+
+        if (settingsError.isEmpty()) {
+            applyAppTheme(restoredSettings.appTheme);
+            applyQuickToolbarVisibility(restoredSettings.showQuickToolbar);
+        }
+
+        QMessageBox::information(
+            this,
+            QStringLiteral("Config backup restored"),
+            QStringLiteral("Restored backup:\n%1\n\nCorrupt config moved to:\n%2")
+                .arg(restoredBackupName.isEmpty() ? QStringLiteral("latest valid backup") : restoredBackupName)
+                .arg(movedCorruptPath.isEmpty() ? QStringLiteral("(no previous config file was present)") : movedCorruptPath)
+        );
+        statusBar()->showMessage(QStringLiteral("Config restored from backup: ") + restoredBackupName);
+        return true;
+    }
+
+    if (messageBox.clickedButton() == freshConfigButton) {
+        const QMessageBox::StandardButton decision = QMessageBox::warning(
+            this,
+            QStringLiteral("Create fresh config?"),
+            QStringLiteral("BetterTTY will move the corrupt BetterTTY.json aside and create a fresh empty config.\n\nSaved sessions, known_hosts, and plaintext secrets will not be copied into the new config. The old corrupt file will be preserved for manual recovery.\n\nContinue?"),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No
+        );
+
+        if (decision != QMessageBox::Yes) {
+            statusBar()->showMessage(QStringLiteral("Create fresh config cancelled"));
+            return false;
+        }
+
+        QString error;
+        QString movedCorruptPath;
+
+        if (!config.createFreshConfigFromCorrupt(&error, &movedCorruptPath)) {
+            QMessageBox::warning(
+                this,
+                QStringLiteral("Could not create fresh config"),
+                error.isEmpty()
+                    ? QStringLiteral("BetterTTY could not create a fresh config.")
+                    : error
+            );
+            statusBar()->showMessage(QStringLiteral("Config recovery failed: fresh config was not created"));
+            return false;
+        }
+
+        loadSavedSessionsToSidebar();
+        applyAppTheme(QStringLiteral("system"));
+        applyQuickToolbarVisibility(false);
+        QMessageBox::information(
+            this,
+            QStringLiteral("Fresh config created"),
+            QStringLiteral("A fresh empty BetterTTY.json was created.\n\nPrevious corrupt config moved to:\n%1")
+                .arg(movedCorruptPath.isEmpty() ? QStringLiteral("(no previous config file was present)") : movedCorruptPath)
+        );
+        statusBar()->showMessage(QStringLiteral("Fresh BetterTTY.json created. Saved session list is empty."));
+        return true;
+    }
+
+    statusBar()->showMessage(QStringLiteral("Config recovery: continuing read-only; BetterTTY.json was not overwritten"));
+    return false;
+}
+
+void MainWindow::setupMenus()
+{
+    auto *fileMenu = menuBar()->addMenu("&File");
+
+    auto *openConfigFolderAction = fileMenu->addAction("Open Config Folder");
+    connect(openConfigFolderAction, &QAction::triggered, this, [this]() {
+        openConfigFolder();
+    });
+
+    fileMenu->addSeparator();
+
+    auto *exportConfigAction = fileMenu->addAction("Export Config...");
+    connect(exportConfigAction, &QAction::triggered, this, [this]() {
+        exportConfig();
+    });
+
+    auto *importConfigAction = fileMenu->addAction("Import Config...");
+    connect(importConfigAction, &QAction::triggered, this, [this]() {
+        importConfig();
+    });
+
+    auto *restoreBackupAction = fileMenu->addAction("Restore Latest Backup...");
+    connect(restoreBackupAction, &QAction::triggered, this, [this]() {
+        restoreLatestConfigBackup();
+    });
+
+    fileMenu->addSeparator();
+
+    auto *exitAction = fileMenu->addAction("Exit");
+    connect(exitAction, &QAction::triggered, this, &QWidget::close);
+
+    auto *sessionMenu = menuBar()->addMenu("&Session");
+
+    auto *newSessionAction = sessionMenu->addAction("New Session");
+    connect(newSessionAction, &QAction::triggered, this, [this]() {
+        showNewSessionDialog();
+    });
+
+    auto *connectAction = sessionMenu->addAction("Connect / Auth test");
+    connect(connectAction, &QAction::triggered, this, [this]() {
+        showManualConnectDialog();
+    });
+
+    auto *editSelectedAction = sessionMenu->addAction("Edit selected session");
+    connect(editSelectedAction, &QAction::triggered, this, [this]() {
+        editSelectedSession();
+    });
+
+    auto *toolsMenu = menuBar()->addMenu("&Tools");
+
+    auto *multiExecAction = toolsMenu->addAction("Multi-Exec");
+    connect(multiExecAction, &QAction::triggered, this, [this]() {
+        statusBar()->showMessage("Multi-Exec placeholder clicked");
+    });
+
+    toolsMenu->addSeparator();
+
+    auto *settingsMenuAction = toolsMenu->addAction("Settings");
+    connect(settingsMenuAction, &QAction::triggered, this, [this]() {
+        showSettingsDialog();
+    });
+
+    auto *helpMenu = menuBar()->addMenu("&Help");
+
+    auto *websiteAction = helpMenu->addAction("BetterTTY Website");
+    connect(websiteAction, &QAction::triggered, this, []() {
+        QDesktopServices::openUrl(QUrl(QStringLiteral("https://bettertty.dev")));
+    });
+
+    auto *supportAction = helpMenu->addAction("Support BetterTTY");
+    connect(supportAction, &QAction::triggered, this, []() {
+        QDesktopServices::openUrl(QUrl(QStringLiteral("https://bettertty.dev/support")));
+    });
+
+    helpMenu->addSeparator();
+
+    auto *aboutAction = helpMenu->addAction("About BetterTTY");
+    connect(aboutAction, &QAction::triggered, this, [this]() {
+        KnownHostsManager knownHosts;
+
+        const QString aboutText =
+            QStringLiteral("BetterTTY\n")
+            + QStringLiteral("A better way to SSH.\n")
+            + QStringLiteral("Your servers. One dock.\n\n")
+            + QStringLiteral("A clean cross-platform SSH and SFTP client.\n\n")
+            + QStringLiteral("Version: ")
+            + QCoreApplication::applicationVersion()
+            + QStringLiteral("\nCodename: ")
+            + QStringLiteral(BETTERTTY_CODENAME_STRING)
+            + QStringLiteral("\nMilestone: ")
+            + QStringLiteral(BETTERTTY_MILESTONE_STRING)
+            + QStringLiteral("\n\nDeveloper: DD-LAB\n")
+            + QStringLiteral("Copyright © 2026 Dalibor Klobučarić\n")
+            + QStringLiteral("License: MIT\n")
+            + QStringLiteral("Website: https://bettertty.dev\n\n")
+            + QStringLiteral("libssh version: ")
+            + SshSession::libsshVersion()
+            + QStringLiteral("\n\nConfig file:\n")
+            + knownHosts.configFilePath()
+            + QStringLiteral("\n\nLog folder:\n")
+            + AppLogger::logDirectoryPath();
+
+        QMessageBox::about(
+            this,
+            "About BetterTTY",
+            aboutText
+        );
+    });
+
+    auto *openLogFolderAction = helpMenu->addAction("Open Log Folder");
+    connect(openLogFolderAction, &QAction::triggered, this, [this]() {
+        openLogFolder();
+    });
+}
+
+void MainWindow::setupToolbar()
+{
+    auto *toolbar = addToolBar("Quick Action Toolbar");
+    toolbar->setObjectName(QStringLiteral("quickActionToolbar"));
+    toolbar->setMovable(false);
+    m_mainToolBar = toolbar;
+
+    auto *newSessionAction = toolbar->addAction("New Session");
+    connect(newSessionAction, &QAction::triggered, this, [this]() {
+        showNewSessionDialog();
+    });
+
+    auto *connectAction = toolbar->addAction("Connect");
+    connect(connectAction, &QAction::triggered, this, [this]() {
+        showManualConnectDialog();
+    });
+
+    toolbar->addSeparator();
+
+    auto *multiExecAction = toolbar->addAction("Multi-Exec");
+    connect(multiExecAction, &QAction::triggered, this, [this]() {
+        statusBar()->showMessage("Multi-Exec placeholder clicked");
+    });
+
+    toolbar->addSeparator();
+
+    auto *settingsAction = toolbar->addAction("Settings");
+    connect(settingsAction, &QAction::triggered, this, [this]() {
+        showSettingsDialog();
+    });
+}
+
+void MainWindow::setupCentralLayout()
+{
+    auto *splitter = new QSplitter(Qt::Horizontal, this);
+
+    m_sessionList = new QListWidget(splitter);
+    m_sessionList->setMinimumWidth(240);
+    m_sessionList->setMaximumWidth(360);
+
+    loadSavedSessionsToSidebar();
+
+    m_sessionList->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_sessionList, &QListWidget::customContextMenuRequested, this, [this](const QPoint &position) {
+        showSessionContextMenu(position);
+    });
+
+    m_tabs = new QTabWidget(splitter);
+    m_tabs->setTabsClosable(true);
+    m_tabs->setMovable(true);
+    m_tabs->setUsesScrollButtons(true);
+    m_tabs->setElideMode(Qt::ElideRight);
+
+    if (m_tabs->tabBar() != nullptr) {
+        m_tabs->tabBar()->setUsesScrollButtons(true);
+        m_tabs->tabBar()->setExpanding(false);
+        m_tabs->tabBar()->setElideMode(Qt::ElideRight);
+    }
+
+    connect(m_tabs, &QTabWidget::currentChanged, this, [this](int) {
+        m_lastTrafficWidget = nullptr;
+        updateTrafficStatusIndicator();
+    });
+
+    connect(m_tabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
+        QWidget *widget = m_tabs->widget(index);
+
+        if (widget == nullptr) {
+            return;
+        }
+
+        if (auto *webTerminal = dynamic_cast<WebTerminalTab *>(widget)) {
+            if (webTerminal->hasActiveShell()) {
+                const QMessageBox::StandardButton decision = QMessageBox::question(
+                    this,
+                    QStringLiteral("Close active SSH terminal?"),
+                    QStringLiteral("The SSH terminal '%1' is still connected.\n\nDisconnect and close this tab?")
+                        .arg(webTerminal->displayName()),
+                    QMessageBox::Yes | QMessageBox::No,
+                    QMessageBox::No
+                );
+
+                if (decision != QMessageBox::Yes) {
+                    statusBar()->showMessage(QStringLiteral("Close tab cancelled: ") + webTerminal->displayName());
+                    return;
+                }
+
+                webTerminal->requestDisconnect();
+            }
+        } else if (auto *basicTerminal = dynamic_cast<BasicTerminalTab *>(widget)) {
+            if (basicTerminal->hasActiveShell()) {
+                const QMessageBox::StandardButton decision = QMessageBox::question(
+                    this,
+                    QStringLiteral("Close active SSH shell?"),
+                    QStringLiteral("The basic SSH shell '%1' is still connected.\n\nDisconnect and close this tab?")
+                        .arg(basicTerminal->displayName()),
+                    QMessageBox::Yes | QMessageBox::No,
+                    QMessageBox::No
+                );
+
+                if (decision != QMessageBox::Yes) {
+                    statusBar()->showMessage(QStringLiteral("Close tab cancelled: ") + basicTerminal->displayName());
+                    return;
+                }
+
+                basicTerminal->requestDisconnect();
+            }
+        }
+
+        m_tabs->removeTab(index);
+        widget->deleteLater();
+
+        if (m_tabs->count() == 0) {
+            addWelcomeTab();
+        }
+
+        m_lastTrafficWidget = nullptr;
+        updateTrafficStatusIndicator();
+    });
+
+    connect(m_sessionList, &QListWidget::itemDoubleClicked, this, [this](QListWidgetItem *item) {
+        const QString sessionId = item->data(Qt::UserRole).toString();
+
+        if (sessionId.trimmed().isEmpty()) {
+            return;
+        }
+
+        openSavedSessionWebTerminal(sessionId);
+    });
+
+    splitter->addWidget(m_sessionList);
+    splitter->addWidget(m_tabs);
+    splitter->setStretchFactor(0, 0);
+    splitter->setStretchFactor(1, 1);
+
+    setCentralWidget(splitter);
+
+    addWelcomeTab();
+}
+
+void MainWindow::loadSavedSessionsToSidebar()
+{
+    if (m_sessionList == nullptr) {
+        return;
+    }
+
+    m_sessionList->clear();
+
+    ConfigManager config;
+    QString loadError;
+    const QList<SessionProfile> sessions = config.loadSessions(&loadError);
+
+    if (!loadError.isEmpty()) {
+        AppLogger::error(QStringLiteral("Saved sessions could not be loaded: ") + loadError);
+        auto *item = new QListWidgetItem("Config problem — sessions not loaded");
+        item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+        item->setToolTip(loadError);
+        m_sessionList->addItem(item);
+        statusBar()->showMessage("Could not load saved sessions: " + loadError);
+        return;
+    }
+
+    if (sessions.isEmpty()) {
+        AppLogger::info(QStringLiteral("Saved sessions loaded: count=0"));
+        auto *item = new QListWidgetItem("No saved sessions yet");
+        item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+        m_sessionList->addItem(item);
+        return;
+    }
+
+    AppLogger::info(QStringLiteral("Saved sessions loaded: count=") + QString::number(sessions.size()));
+
+    for (const SessionProfile &session : sessions) {
+        const QString label = session.group.trimmed().isEmpty()
+            ? session.name
+            : session.group.trimmed() + QStringLiteral(" / ") + session.name;
+
+        auto *item = new QListWidgetItem(label);
+        item->setData(Qt::UserRole, session.id);
+        item->setToolTip(
+            session.username
+            + QStringLiteral("@")
+            + session.host
+            + QStringLiteral(":")
+            + QString::number(session.port)
+        );
+
+        m_sessionList->addItem(item);
+    }
+}
+
+void MainWindow::addWelcomeTab()
+{
+    auto *welcome = new QTextEdit(this);
+    welcome->setReadOnly(true);
+    welcome->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+
+    welcome->setPlainText(
+        "BetterTTY 1.0 — Andromeda\n\n"
+        "A better way to SSH.\n"
+        "Your servers. One dock.\n\n"
+        "BetterTTY is a clean cross-platform SSH and SFTP client for managing saved servers, terminal sessions, and files.\n\n"
+        "Quick start:\n"
+        "- Double-click a saved session to open the xterm.js SSH terminal.\n"
+        "- Right-click a saved session and choose Open file manager for SFTP.\n"
+        "- Use Session -> New Session to add a server.\n\n"
+        "Core features:\n"
+        "- saved sessions in BetterTTY.json\n"
+        "- password and private-key authentication\n"
+        "- known-host verification with multi-key host entries per host:port\n"
+        "- create/edit/delete saved sessions and duplicate-session warnings\n"
+        "- bundled xterm.js terminal with SSH PTY resize sync\n"
+        "- multiline paste handling and Ctrl+C remote interrupt support\n"
+        "- two-panel local/remote SFTP file manager\n"
+        "- queue-first upload/download workflow and recursive folder queueing\n"
+        "- overwrite/skip decisions, retry support, and queued delete safety\n"
+        "- config import/export/restore and corrupt-config recovery\n"
+        "- optional diagnostic logging, OFF by default\n"
+        "- live terminal and SFTP Session Traffic counters\n\n"
+        "Current file-manager limits:\n"
+        "- no sync/mirror engine\n"
+        "- no partial-transfer resume\n"
+        "- no parallel transfers\n"
+        "- no recursive deletion of non-empty folders\n"
+        "- no chmod/chown/rename yet\n"
+        "- no permission/timestamp preservation yet\n"
+        "- no symlink following during folder transfer\n\n"
+        "Security note:\n"
+        "BetterTTY currently supports portable plain-v1 secrets in BetterTTY.json. Keep the config private and use BetterTTY only on trusted machines.\n\n"
+        "Documentation:\n"
+        "- README.md\n"
+        "- docs/GETTING_STARTED.md\n"
+        "- docs/USER_GUIDE.md\n"
+        "- docs/SECURITY_NOTES.md\n"
+        "- docs/KNOWN_LIMITATIONS.md\n"
+        "- docs/BUILD_AND_TEST_1.0.md\n"
+        "- docs/TESTCASE_1.0.md\n\n"
+        "Website: https://bettertty.dev\n"
+        "License: MIT\n"
+        "Copyright © 2026 Dalibor Klobučarić\n"
+    );
+
+
+    m_tabs->addTab(welcome, "Welcome");
+}
+
+
+void MainWindow::openSftpBrowserForSavedSession(const QString &sessionId)
+{
+    ConfigManager config;
+    SessionProfile session;
+    QString loadError;
+
+    auto addStatusTab = [this, &session](const QString &titleSuffix, const QString &text) {
+        auto *statusTab = new QTextEdit(this);
+        statusTab->setReadOnly(true);
+        statusTab->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        statusTab->setPlainText(text);
+
+        const QString tabName = session.name.trimmed().isEmpty()
+            ? QStringLiteral("file manager status")
+            : session.name + QStringLiteral(" ") + titleSuffix;
+        const int tabIndex = m_tabs->addTab(statusTab, tabName);
+        m_tabs->setCurrentIndex(tabIndex);
+    };
+
+    if (!config.loadSessionById(sessionId, &session, &loadError)) {
+        QMessageBox::warning(
+            this,
+            QStringLiteral("Could not load saved session"),
+            loadError
+        );
+        statusBar()->showMessage(QStringLiteral("Could not load saved session for SFTP file manager: ") + sessionId);
+        return;
+    }
+
+    AppLogger::info(QStringLiteral("SFTP file manager requested: session=\"") + session.name
+        + QStringLiteral("\", host=") + session.host
+        + QStringLiteral(", port=") + QString::number(session.port)
+        + QStringLiteral(", user=") + session.username);
+
+    const QString tabTitle =
+        session.username
+        + QStringLiteral("@")
+        + session.host
+        + QStringLiteral(":")
+        + QString::number(session.port);
+
+    const QString authLabel =
+        session.authType == SessionProfile::AuthType::Password
+            ? QStringLiteral("Password")
+            : QStringLiteral("Private key");
+
+    const QString secretRef =
+        session.authType == SessionProfile::AuthType::Password
+            ? session.secretRef
+            : session.keyRef;
+
+    QString preflightText;
+    preflightText += QStringLiteral("BetterTTY file manager transfer preflight\n\n");
+    preflightText += QStringLiteral("BetterTTY 1.0 — Andromeda SFTP preflight\n\n");
+    preflightText += QStringLiteral("Session: ") + session.name + QStringLiteral("\n");
+    preflightText += QStringLiteral("Session id: ") + session.id + QStringLiteral("\n");
+    preflightText += QStringLiteral("Group: ") + (session.group.trimmed().isEmpty() ? QStringLiteral("(none)") : session.group) + QStringLiteral("\n\n");
+    preflightText += QStringLiteral("Host: ") + session.host + QStringLiteral("\n");
+    preflightText += QStringLiteral("Port: ") + QString::number(session.port) + QStringLiteral("\n");
+    preflightText += QStringLiteral("Username: ") + session.username + QStringLiteral("\n");
+    preflightText += QStringLiteral("Auth type: ") + authLabel + QStringLiteral("\n");
+    preflightText += QStringLiteral("Secret ref: ") + secretRef + QStringLiteral("\n");
+    preflightText += QStringLiteral("Secret value: loaded from BetterTTY.json, hidden from display\n\n");
+    preflightText += QStringLiteral("Scope:\n");
+    preflightText += QStringLiteral("- open a graphical two-panel file manager tab\n");
+    preflightText += QStringLiteral("- use saved session data and plain-v1 secret references\n");
+    preflightText += QStringLiteral("- use existing known-host prompt and trust-chain preflight\n");
+    preflightText += QStringLiteral("- verify the approved host key again before SFTP authentication\n");
+    preflightText += QStringLiteral("- browse local directories and remote SFTP directories side by side with Refresh, Up, editable paths, and double-click folder navigation\n");
+    preflightText += QStringLiteral("- download one selected remote file into the current local folder\n");
+    preflightText += QStringLiteral("- show overwrite warning and basic download progress\n");
+    preflightText += QStringLiteral("- no delete, rename, chmod, sync, resume, or parallel transfer yet\n\n");
+
+    QString secretValue;
+    QString secretType;
+    QString secretError;
+
+    if (!config.loadPlainSecret(secretRef, &secretValue, &secretType, &secretError)) {
+        preflightText += QStringLiteral("Secret load result:\n");
+        preflightText += QStringLiteral("Status: FAILED\n");
+        preflightText += QStringLiteral("Message: ") + secretError + QStringLiteral("\n\n");
+        preflightText += QStringLiteral("SFTP file manager was NOT opened.\n");
+        addStatusTab(QStringLiteral("file manager error"), preflightText);
+        statusBar()->showMessage(QStringLiteral("SFTP file manager secret load failed for ") + tabTitle);
+        return;
+    }
+
+    const QString expectedSecretType =
+        session.authType == SessionProfile::AuthType::Password
+            ? QStringLiteral("password")
+            : QStringLiteral("private_key");
+
+    if (secretType != expectedSecretType) {
+        preflightText += QStringLiteral("Secret load result:\n");
+        preflightText += QStringLiteral("Status: FAILED\n");
+        preflightText += QStringLiteral("Message: Secret type mismatch. Expected ")
+            + expectedSecretType
+            + QStringLiteral(", got ")
+            + secretType
+            + QStringLiteral(".\n\n");
+        preflightText += QStringLiteral("SFTP file manager was NOT opened.\n");
+        addStatusTab(QStringLiteral("file manager error"), preflightText);
+        statusBar()->showMessage(QStringLiteral("SFTP file manager secret type mismatch for ") + tabTitle);
+        return;
+    }
+
+    preflightText += QStringLiteral("Secret load result:\n");
+    preflightText += QStringLiteral("Status: SUCCESS\n");
+    preflightText += QStringLiteral("Message: Plaintext secret loaded from BetterTTY.json. Value is hidden.\n\n");
+
+    statusBar()->showMessage(QStringLiteral("Running SSH preflight before SFTP file manager for ") + tabTitle + QStringLiteral("..."));
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QApplication::processEvents();
+
+    const SshHandshakeResult handshake = SshSession::testHandshake(
+        session.host,
+        session.port,
+        session.username
+    );
+
+    QApplication::restoreOverrideCursor();
+
+    preflightText += QStringLiteral("SSH preflight result:\n");
+
+    bool knownHostAllowed = false;
+    QString knownHostDecision = QStringLiteral("Not checked");
+    QString knownHostExtra;
+    KnownHostsManager knownHosts;
+
+    if (handshake.success) {
+        preflightText += QStringLiteral("Status: SUCCESS\n");
+        preflightText += QStringLiteral("Message: ") + handshake.message + QStringLiteral("\n");
+        preflightText += QStringLiteral("Server banner: ") + handshake.serverBanner + QStringLiteral("\n");
+        preflightText += QStringLiteral("Host key type: ") + handshake.hostKeyType + QStringLiteral("\n");
+        preflightText += QStringLiteral("Host key fingerprint: ") + handshake.hostKeyFingerprint + QStringLiteral("\n\n");
+
+        const KnownHostsManager::CheckResult check = knownHosts.checkHost(
+            session.host,
+            session.port,
+            handshake.hostKeyType,
+            handshake.hostKeyFingerprint
+        );
+
+        const KnownHostDecisionResult knownHostResult = promptKnownHostDecision(
+            this,
+            knownHosts,
+            check,
+            session.host,
+            session.port,
+            handshake.hostKeyType,
+            handshake.hostKeyFingerprint,
+            false
+        );
+
+        knownHostAllowed = knownHostResult.allowed;
+        knownHostDecision = knownHostResult.decision;
+        knownHostExtra = knownHostResult.extra;
+
+        preflightText += QStringLiteral("Known-host result:\n");
+        preflightText += QStringLiteral("Decision: ") + knownHostDecision + QStringLiteral("\n");
+        preflightText += QStringLiteral("Config file: ") + knownHosts.configFilePath() + QStringLiteral("\n");
+
+        if (!knownHostExtra.isEmpty()) {
+            preflightText += QStringLiteral("Extra: ") + knownHostExtra + QStringLiteral("\n");
+        }
+
+        preflightText += QStringLiteral("\n");
+    } else {
+        preflightText += QStringLiteral("Status: FAILED\n");
+        preflightText += QStringLiteral("Message: ") + handshake.message + QStringLiteral("\n");
+        preflightText += QStringLiteral("libssh error code: ") + QString::number(handshake.sshErrorCode) + QStringLiteral("\n");
+        preflightText += QStringLiteral("Error: ") + handshake.error + QStringLiteral("\n\n");
+        preflightText += QStringLiteral("Known-host result:\n");
+        preflightText += QStringLiteral("Decision: Not checked because handshake failed\n\n");
+        preflightText += QStringLiteral("SFTP file manager was NOT opened.\n");
+        addStatusTab(QStringLiteral("file manager error"), preflightText);
+        statusBar()->showMessage(QStringLiteral("SFTP file manager preflight failed for ") + tabTitle);
+        return;
+    }
+
+    if (!knownHostAllowed) {
+        preflightText += QStringLiteral("Connection flow stopped at known-host decision.\n");
+        preflightText += QStringLiteral("SFTP file manager was NOT opened.\n");
+        addStatusTab(QStringLiteral("file manager cancelled"), preflightText);
+        statusBar()->showMessage(QStringLiteral("SFTP file manager cancelled by known-host decision for ") + tabTitle);
+        return;
+    }
+
+    preflightText += QStringLiteral("Known-host decision allows SFTP file manager.\n\n");
+    preflightText += QStringLiteral("Opening two-panel file manager tab with single-file download/upload enabled.\n");
+
+    const SshHostKeyExpectation hostKeyExpectation = makeHostKeyExpectation(
+        session.host,
+        session.port,
+        handshake.hostKeyType,
+        handshake.hostKeyFingerprint,
+        knownHostDecision
+    );
+
+    const SshAuthMethod authMethod =
+        session.authType == SessionProfile::AuthType::Password
+            ? SshAuthMethod::Password
+            : SshAuthMethod::PrivateKey;
+
+    auto *browserTab = new SftpBrowserTab(
+        session.name,
+        session.host,
+        session.port,
+        session.username,
+        authMethod,
+        secretValue,
+        hostKeyExpectation,
+        this
+    );
+
+    const int tabIndex = m_tabs->addTab(browserTab, session.name + QStringLiteral(" files"));
+    m_tabs->setCurrentIndex(tabIndex);
+
+    statusBar()->showMessage(QStringLiteral("Opened file manager for ") + tabTitle);
+}
+
+
+void MainWindow::showSessionContextMenu(const QPoint &position)
+{
+    if (m_sessionList == nullptr) {
+        return;
+    }
+
+    QListWidgetItem *item = m_sessionList->itemAt(position);
+
+    if (item == nullptr) {
+        return;
+    }
+
+    const QString sessionId = item->data(Qt::UserRole).toString();
+
+    if (sessionId.trimmed().isEmpty()) {
+        return;
+    }
+
+    QMenu menu(this);
+    QAction *openWebTerminalAction = menu.addAction("Open terminal");
+    QAction *fileManagerAction = menu.addAction("Open file manager");
+    QAction *connectAction = menu.addAction("Run auth test");
+    QAction *openShellAction = menu.addAction("Open fallback shell");
+    menu.addSeparator();
+    QAction *editAction = menu.addAction("Edit session");
+    QAction *deleteAction = menu.addAction("Delete session");
+
+    QAction *selectedAction = menu.exec(m_sessionList->viewport()->mapToGlobal(position));
+
+    if (selectedAction == connectAction) {
+        testSavedSession(sessionId);
+    } else if (selectedAction == openWebTerminalAction) {
+        openSavedSessionWebTerminal(sessionId);
+    } else if (selectedAction == fileManagerAction) {
+        openSftpBrowserForSavedSession(sessionId);
+    } else if (selectedAction == openShellAction) {
+        openSavedSessionShell(sessionId);
+    } else if (selectedAction == editAction) {
+        editSavedSession(sessionId);
+    } else if (selectedAction == deleteAction) {
+        deleteSavedSession(sessionId);
+    }
+}
+
+void MainWindow::editSelectedSession()
+{
+    if (m_sessionList == nullptr) {
+        return;
+    }
+
+    QListWidgetItem *item = m_sessionList->currentItem();
+
+    if (item == nullptr || item->data(Qt::UserRole).toString().trimmed().isEmpty()) {
+        QMessageBox::information(
+            this,
+            QStringLiteral("No saved session selected"),
+            QStringLiteral("Select a saved session in the sidebar first, then choose Session → Edit selected session.")
+        );
+        statusBar()->showMessage(QStringLiteral("Edit selected session: no saved session selected"));
+        return;
+    }
+
+    editSavedSession(item->data(Qt::UserRole).toString());
+}
+
+void MainWindow::editSavedSession(const QString &sessionId)
+{
+    ConfigManager config;
+    SessionProfile existingSession;
+    QString loadError;
+
+    if (!config.loadSessionById(sessionId, &existingSession, &loadError)) {
+        QMessageBox::warning(
+            this,
+            "Could not load saved session",
+            loadError
+        );
+        statusBar()->showMessage("Could not load saved session for editing: " + sessionId);
+        loadSavedSessionsToSidebar();
+        return;
+    }
+
+    ConnectDialog dialog(this);
+    dialog.setEditMode(true);
+    dialog.setConnectionFields(
+        existingSession.host,
+        existingSession.port,
+        existingSession.username,
+        existingSession.authType == SessionProfile::AuthType::PrivateKey
+            ? ConnectDialog::AuthType::PrivateKey
+            : ConnectDialog::AuthType::Password
+    );
+    dialog.setSessionFields(existingSession.name, existingSession.group);
+
+    if (dialog.exec() != QDialog::Accepted) {
+        statusBar()->showMessage("Edit session cancelled");
+        return;
+    }
+
+    SessionProfile updatedSession;
+    updatedSession.name = dialog.sessionName();
+    updatedSession.group = dialog.groupName();
+    updatedSession.host = dialog.host();
+    updatedSession.port = dialog.port();
+    updatedSession.username = dialog.username();
+    updatedSession.id = ConfigManager::makeSessionId(
+        updatedSession.name,
+        updatedSession.host,
+        updatedSession.port,
+        updatedSession.username
+    );
+    updatedSession.authType = dialog.authType() == ConnectDialog::AuthType::PrivateKey
+        ? SessionProfile::AuthType::PrivateKey
+        : SessionProfile::AuthType::Password;
+
+    QString replacementSecret;
+    bool replaceSecret = false;
+
+    if (updatedSession.authType == SessionProfile::AuthType::Password) {
+        if (!dialog.password().isEmpty()) {
+            replacementSecret = dialog.password();
+            replaceSecret = true;
+        }
+    } else {
+        if (!dialog.keyPath().trimmed().isEmpty()) {
+            QString expandedKeyPath = dialog.keyPath();
+
+            if (expandedKeyPath.startsWith(QStringLiteral("~/"))) {
+                expandedKeyPath = QDir::homePath() + expandedKeyPath.mid(1);
+            }
+
+            QFile keyFile(expandedKeyPath);
+
+            if (!keyFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                QMessageBox::warning(
+                    this,
+                    "Could not read private key",
+                    "Could not read private key file for JSON save: " + keyFile.errorString()
+                );
+                statusBar()->showMessage("Could not read replacement private key");
+                return;
+            }
+
+            replacementSecret = QString::fromUtf8(keyFile.readAll());
+            keyFile.close();
+            replaceSecret = true;
+        }
+    }
+
+    const bool authTypeChanged = updatedSession.authType != existingSession.authType;
+
+    if (authTypeChanged && !replaceSecret) {
+        QMessageBox::warning(
+            this,
+            "New secret required",
+            "Authentication type was changed. Please enter a new password or choose a new private key file."
+        );
+        statusBar()->showMessage("Edit session requires a new secret when auth type changes");
+        return;
+    }
+
+    QString updateError;
+    bool changedSessionId = false;
+
+    if (!config.updateSessionWithOptionalPlainSecret(
+            existingSession.id,
+            updatedSession,
+            replacementSecret,
+            replaceSecret,
+            &updateError,
+            &changedSessionId
+        )) {
+        QMessageBox::warning(
+            this,
+            "Could not update saved session",
+            updateError
+        );
+        statusBar()->showMessage("Could not update saved session: " + existingSession.name);
+        return;
+    }
+
+    loadSavedSessionsToSidebar();
+
+    QString message = "Updated saved session: " + updatedSession.name;
+
+    if (changedSessionId) {
+        message += " (session id changed)";
+    }
+
+    if (replaceSecret) {
+        message += " and replaced plaintext secret";
+    } else {
+        message += " and kept existing plaintext secret";
+    }
+
+    statusBar()->showMessage(message);
+}
+
+void MainWindow::deleteSavedSession(const QString &sessionId)
+{
+    ConfigManager config;
+    SessionProfile session;
+    QString loadError;
+
+    if (!config.loadSessionById(sessionId, &session, &loadError)) {
+        QMessageBox::warning(
+            this,
+            "Could not load saved session",
+            loadError
+        );
+        statusBar()->showMessage("Could not load saved session for deletion: " + sessionId);
+        loadSavedSessionsToSidebar();
+        return;
+    }
+
+    const QString target =
+        session.username
+        + QStringLiteral("@")
+        + session.host
+        + QStringLiteral(":")
+        + QString::number(session.port);
+
+    QMessageBox confirmBox(this);
+    confirmBox.setIcon(QMessageBox::Warning);
+    confirmBox.setWindowTitle("Delete saved session");
+    confirmBox.setText("Delete saved session?");
+    confirmBox.setInformativeText(
+        "Session: " + session.name + "\n"
+        "Target: " + target + "\n\n"
+        "This removes the saved session and its password/private-key secret if no other session uses it.\n"
+        "Known-host trust records will NOT be deleted."
+    );
+
+    QAbstractButton *deleteButton = confirmBox.addButton("Delete session", QMessageBox::DestructiveRole);
+    QAbstractButton *cancelButton = confirmBox.addButton("Cancel", QMessageBox::RejectRole);
+    confirmBox.setDefaultButton(qobject_cast<QPushButton *>(cancelButton));
+    confirmBox.exec();
+
+    if (confirmBox.clickedButton() != deleteButton) {
+        statusBar()->showMessage("Delete session cancelled");
+        return;
+    }
+
+    QString deleteError;
+    bool removedSecret = false;
+    QString removedSecretId;
+
+    if (!config.deleteSession(session.id, &deleteError, &removedSecret, &removedSecretId)) {
+        QMessageBox::warning(
+            this,
+            "Could not delete saved session",
+            deleteError
+        );
+        statusBar()->showMessage("Could not delete saved session: " + session.name);
+        return;
+    }
+
+    loadSavedSessionsToSidebar();
+
+    QString message = "Deleted saved session: " + session.name;
+
+    if (removedSecret) {
+        message += " and removed unused secret";
+    } else {
+        message += ". Secret was kept because it is shared or missing";
+    }
+
+    statusBar()->showMessage(message);
+}
+
+
+void MainWindow::openSavedSessionShell(const QString &sessionId)
+{
+    openSavedSessionShellInternal(sessionId, false);
+}
+
+void MainWindow::openSavedSessionWebTerminal(const QString &sessionId)
+{
+    openSavedSessionShellInternal(sessionId, true);
+}
+
+void MainWindow::openSavedSessionShellInternal(const QString &sessionId, bool useWebTerminal)
+{
+    AppLogger::info(QStringLiteral("Open saved session terminal requested: sessionId=") + sessionId
+        + QStringLiteral(", terminal=") + (useWebTerminal ? QStringLiteral("xterm.js") : QStringLiteral("basic")));
+
+    ConfigManager config;
+    SessionProfile session;
+    QString loadError;
+
+    if (!config.loadSessionById(sessionId, &session, &loadError)) {
+        QMessageBox::warning(
+            this,
+            "Could not load saved session",
+            loadError
+        );
+        statusBar()->showMessage("Could not load saved session for shell: " + sessionId);
+        return;
+    }
+
+    AppLogger::info(QStringLiteral("Opening terminal for saved session: session=\"") + session.name
+        + QStringLiteral("\", host=") + session.host
+        + QStringLiteral(", port=") + QString::number(session.port)
+        + QStringLiteral(", user=") + session.username);
+
+    const QString tabTitle =
+        session.username
+        + QStringLiteral("@")
+        + session.host
+        + QStringLiteral(":")
+        + QString::number(session.port);
+
+    const QString secretRef = session.authType == SessionProfile::AuthType::Password
+        ? session.secretRef
+        : session.keyRef;
+
+    QString secretValue;
+    QString secretType;
+    QString secretError;
+
+    if (!config.loadPlainSecret(secretRef, &secretValue, &secretType, &secretError)) {
+        QMessageBox::warning(
+            this,
+            "Could not load saved secret",
+            secretError
+        );
+        statusBar()->showMessage("Could not load plaintext secret for shell: " + tabTitle);
+        return;
+    }
+
+    const QString expectedSecretType = session.authType == SessionProfile::AuthType::Password
+        ? QStringLiteral("password")
+        : QStringLiteral("private_key");
+
+    if (secretType != expectedSecretType) {
+        QMessageBox::warning(
+            this,
+            "Saved secret type mismatch",
+            "Expected secret type: " + expectedSecretType + "\n"
+            "Actual secret type: " + secretType
+        );
+        statusBar()->showMessage("Saved secret type mismatch for shell: " + tabTitle);
+        return;
+    }
+
+    statusBar()->showMessage("Checking known-host trust before opening shell for " + tabTitle + "...");
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QApplication::processEvents();
+
+    const SshHandshakeResult handshake = SshSession::testHandshake(
+        session.host,
+        session.port,
+        session.username
+    );
+
+    QApplication::restoreOverrideCursor();
+
+    if (!handshake.success) {
+        QMessageBox::warning(
+            this,
+            "SSH handshake failed",
+            "Could not connect before opening shell.\n\n"
+            "Message: " + handshake.message + "\n"
+            "Error: " + handshake.error
+        );
+        statusBar()->showMessage("Shell handshake failed for " + tabTitle);
+        return;
+    }
+
+    KnownHostsManager knownHosts;
+    const KnownHostsManager::CheckResult check = knownHosts.checkHost(
+        session.host,
+        session.port,
+        handshake.hostKeyType,
+        handshake.hostKeyFingerprint
+    );
+
+    const KnownHostDecisionResult knownHostResult = promptKnownHostDecision(
+        this,
+        knownHosts,
+        check,
+        session.host,
+        session.port,
+        handshake.hostKeyType,
+        handshake.hostKeyFingerprint,
+        true
+    );
+
+    const bool knownHostAllowed = knownHostResult.allowed;
+
+    if (!knownHostResult.extra.isEmpty()) {
+        statusBar()->showMessage("Shell known-host warning: " + knownHostResult.extra);
+    }
+
+    if (!knownHostAllowed) {
+        statusBar()->showMessage("Shell open cancelled by known-host decision for " + tabTitle);
+        return;
+    }
+
+    const SshHostKeyExpectation hostKeyExpectation = makeHostKeyExpectation(
+        session.host,
+        session.port,
+        handshake.hostKeyType,
+        handshake.hostKeyFingerprint,
+        knownHostResult.decision
+    );
+
+    QWidget *terminal = nullptr;
+    QString titleSuffix;
+
+    if (useWebTerminal) {
+        terminal = new WebTerminalTab(session, secretValue, hostKeyExpectation, this);
+        titleSuffix = QStringLiteral(" xterm");
+    } else {
+        terminal = new BasicTerminalTab(session, secretValue, hostKeyExpectation, this);
+        titleSuffix = QStringLiteral(" shell");
+    }
+
+    const int tabIndex = m_tabs->addTab(terminal, session.name + titleSuffix);
+    m_tabs->setCurrentIndex(tabIndex);
+
+    if (auto *webTerminal = dynamic_cast<WebTerminalTab *>(terminal)) {
+        connect(webTerminal, &WebTerminalTab::tabTitleChanged, this, [this, webTerminal](const QString &title) {
+            const int index = m_tabs->indexOf(webTerminal);
+
+            if (index >= 0) {
+                m_tabs->setTabText(index, title);
+            }
+        });
+        connect(webTerminal, &WebTerminalTab::lifecycleStatusChanged, this, [this](const QString &status) {
+            statusBar()->showMessage(status);
+        });
+    } else if (auto *basicTerminal = dynamic_cast<BasicTerminalTab *>(terminal)) {
+        connect(basicTerminal, &BasicTerminalTab::tabTitleChanged, this, [this, basicTerminal](const QString &title) {
+            const int index = m_tabs->indexOf(basicTerminal);
+
+            if (index >= 0) {
+                m_tabs->setTabText(index, title);
+            }
+        });
+        connect(basicTerminal, &BasicTerminalTab::lifecycleStatusChanged, this, [this](const QString &status) {
+            statusBar()->showMessage(status);
+        });
+    }
+
+    statusBar()->showMessage(
+        useWebTerminal
+            ? "Opening xterm.js terminal for " + tabTitle
+            : "Opening basic shell for " + tabTitle
+    );
+    m_lastTrafficWidget = nullptr;
+    updateTrafficStatusIndicator();
+}
+
+void MainWindow::testSavedSession(const QString &sessionId)
+{
+    ConfigManager config;
+    SessionProfile session;
+    QString loadError;
+
+    if (!config.loadSessionById(sessionId, &session, &loadError)) {
+        QMessageBox::warning(
+            this,
+            "Could not load saved session",
+            loadError
+        );
+        statusBar()->showMessage("Could not load saved session: " + sessionId);
+        return;
+    }
+
+    AppLogger::info(QStringLiteral("Saved session auth test requested: session=\"") + session.name
+        + QStringLiteral("\", host=") + session.host
+        + QStringLiteral(", port=") + QString::number(session.port)
+        + QStringLiteral(", user=") + session.username);
+
+    const QString tabTitle =
+        session.username
+        + QStringLiteral("@")
+        + session.host
+        + QStringLiteral(":")
+        + QString::number(session.port);
+
+    const QString authLabel =
+        session.authType == SessionProfile::AuthType::Password
+            ? QStringLiteral("Password")
+            : QStringLiteral("Private key");
+
+    const QString secretRef =
+        session.authType == SessionProfile::AuthType::Password
+            ? session.secretRef
+            : session.keyRef;
+
+    QString secretValue;
+    QString secretType;
+    QString secretError;
+    const bool secretLoaded = config.loadPlainSecret(
+        secretRef,
+        &secretValue,
+        &secretType,
+        &secretError
+    );
+
+    QString output;
+    output += QStringLiteral("BetterTTY saved session connection test\n\n");
+    output += QStringLiteral("Session: ") + session.name + QStringLiteral("\n");
+    output += QStringLiteral("Session id: ") + session.id + QStringLiteral("\n");
+    output += QStringLiteral("Group: ") + (session.group.trimmed().isEmpty() ? QStringLiteral("(none)") : session.group) + QStringLiteral("\n\n");
+    output += QStringLiteral("Host: ") + session.host + QStringLiteral("\n");
+    output += QStringLiteral("Port: ") + QString::number(session.port) + QStringLiteral("\n");
+    output += QStringLiteral("Username: ") + session.username + QStringLiteral("\n");
+    output += QStringLiteral("Auth type: ") + authLabel + QStringLiteral("\n");
+    output += QStringLiteral("Secret ref: ") + secretRef + QStringLiteral("\n");
+
+    if (session.authType == SessionProfile::AuthType::Password) {
+        output += QStringLiteral("Saved password: loaded from JSON, hidden from display\n\n");
+    } else {
+        output += QStringLiteral("Saved private key: loaded from JSON, hidden from display\n\n");
+    }
+
+    if (!secretLoaded) {
+        output += QStringLiteral("Secret load result:\n");
+        output += QStringLiteral("Status: FAILED\n");
+        output += QStringLiteral("Message: ") + secretError + QStringLiteral("\n\n");
+        output += QStringLiteral("Authentication was NOT attempted.\n");
+
+        auto *terminalPlaceholder = new QTextEdit(this);
+        terminalPlaceholder->setReadOnly(true);
+        terminalPlaceholder->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        terminalPlaceholder->setPlainText(output);
+
+        const int tabIndex = m_tabs->addTab(terminalPlaceholder, session.name);
+        m_tabs->setCurrentIndex(tabIndex);
+        statusBar()->showMessage("Saved session secret could not be loaded for " + tabTitle);
+        return;
+    }
+
+    const QString expectedSecretType =
+        session.authType == SessionProfile::AuthType::Password
+            ? QStringLiteral("password")
+            : QStringLiteral("private_key");
+
+    if (secretType != expectedSecretType) {
+        output += QStringLiteral("Secret load result:\n");
+        output += QStringLiteral("Status: FAILED\n");
+        output += QStringLiteral("Message: Secret type mismatch. Expected ")
+            + expectedSecretType
+            + QStringLiteral(", got ")
+            + secretType
+            + QStringLiteral(".\n\n");
+        output += QStringLiteral("Authentication was NOT attempted.\n");
+
+        auto *terminalPlaceholder = new QTextEdit(this);
+        terminalPlaceholder->setReadOnly(true);
+        terminalPlaceholder->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+        terminalPlaceholder->setPlainText(output);
+
+        const int tabIndex = m_tabs->addTab(terminalPlaceholder, session.name);
+        m_tabs->setCurrentIndex(tabIndex);
+        statusBar()->showMessage("Saved session secret type mismatch for " + tabTitle);
+        return;
+    }
+
+    output += QStringLiteral("Secret load result:\n");
+    output += QStringLiteral("Status: SUCCESS\n");
+    output += QStringLiteral("Message: Plaintext secret loaded from BetterTTY.json. Value is hidden.\n\n");
+
+    statusBar()->showMessage("Testing saved SSH session with " + tabTitle + "...");
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QApplication::processEvents();
+
+    const SshHandshakeResult handshake = SshSession::testHandshake(
+        session.host,
+        session.port,
+        session.username
+    );
+
+    QApplication::restoreOverrideCursor();
+
+    KnownHostsManager knownHosts;
+
+    bool knownHostAllowed = false;
+    QString knownHostDecision = QStringLiteral("Not checked");
+    QString knownHostExtra;
+
+    if (handshake.success) {
+        const KnownHostsManager::CheckResult check = knownHosts.checkHost(
+            session.host,
+            session.port,
+            handshake.hostKeyType,
+            handshake.hostKeyFingerprint
+        );
+
+        const KnownHostDecisionResult knownHostResult = promptKnownHostDecision(
+            this,
+            knownHosts,
+            check,
+            session.host,
+            session.port,
+            handshake.hostKeyType,
+            handshake.hostKeyFingerprint,
+            false
+        );
+
+        knownHostAllowed = knownHostResult.allowed;
+        knownHostDecision = knownHostResult.decision;
+        knownHostExtra = knownHostResult.extra;
+    }
+
+    output += QStringLiteral("SSH handshake result:\n");
+
+    bool authAttempted = false;
+    bool authSuccessful = false;
+    SshAuthResult authResult;
+    QString tempKeyError;
+
+    if (handshake.success) {
+        output += QStringLiteral("Status: SUCCESS\n");
+        output += QStringLiteral("Message: ") + handshake.message + QStringLiteral("\n");
+        output += QStringLiteral("Server banner: ") + handshake.serverBanner + QStringLiteral("\n");
+        output += QStringLiteral("Host key type: ") + handshake.hostKeyType + QStringLiteral("\n");
+        output += QStringLiteral("Host key fingerprint: ") + handshake.hostKeyFingerprint + QStringLiteral("\n\n");
+
+        output += QStringLiteral("Known-host result:\n");
+        output += QStringLiteral("Decision: ") + knownHostDecision + QStringLiteral("\n");
+        output += QStringLiteral("Config file: ") + knownHosts.configFilePath() + QStringLiteral("\n");
+
+        if (!knownHostExtra.isEmpty()) {
+            output += QStringLiteral("Extra: ") + knownHostExtra + QStringLiteral("\n");
+        }
+
+        output += QStringLiteral("\n");
+
+        if (knownHostAllowed) {
+            output += QStringLiteral("Known-host decision allows continuing.\n\n");
+
+            const SshAuthMethod authMethod =
+                session.authType == SessionProfile::AuthType::Password
+                    ? SshAuthMethod::Password
+                    : SshAuthMethod::PrivateKey;
+
+            QString passwordForAuth;
+            QString keyPathForAuth;
+            QTemporaryFile tempKeyFile(QDir::tempPath() + QStringLiteral("/bettertty-key-XXXXXX"));
+
+            if (session.authType == SessionProfile::AuthType::Password) {
+                passwordForAuth = secretValue;
+            } else {
+                tempKeyFile.setAutoRemove(true);
+
+                if (!tempKeyFile.open()) {
+                    tempKeyError = QStringLiteral("Could not create temporary private key file: ") + tempKeyFile.errorString();
+                } else {
+                    tempKeyFile.write(secretValue.toUtf8());
+                    tempKeyFile.flush();
+                    keyPathForAuth = tempKeyFile.fileName();
+                    tempKeyFile.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+                    tempKeyFile.close();
+                }
+            }
+
+            if (!tempKeyError.isEmpty()) {
+                output += QStringLiteral("Authentication result:\n");
+                output += QStringLiteral("Status: FAILED\n");
+                output += QStringLiteral("Message: ") + tempKeyError + QStringLiteral("\n");
+            } else {
+                statusBar()->showMessage("Testing saved SSH authentication with " + tabTitle + "...");
+                QApplication::setOverrideCursor(Qt::WaitCursor);
+                QApplication::processEvents();
+
+                const SshHostKeyExpectation hostKeyExpectation = makeHostKeyExpectation(
+                    session.host,
+                    session.port,
+                    handshake.hostKeyType,
+                    handshake.hostKeyFingerprint,
+                    knownHostDecision
+                );
+
+                authResult = SshSession::testAuthentication(
+                    session.host,
+                    session.port,
+                    session.username,
+                    authMethod,
+                    passwordForAuth,
+                    keyPathForAuth,
+                    hostKeyExpectation
+                );
+
+                QApplication::restoreOverrideCursor();
+
+                authAttempted = true;
+                authSuccessful = authResult.success;
+
+                output += QStringLiteral("Authentication result:\n");
+
+                if (authResult.hostKeyVerificationAttempted) {
+                    output += QStringLiteral("Host-key verification before auth: ")
+                        + (authResult.hostKeyVerified ? QStringLiteral("VERIFIED") : QStringLiteral("FAILED"))
+                        + QStringLiteral("\n");
+                    output += QStringLiteral("Auth connection key type: ") + authResult.hostKeyType + QStringLiteral("\n");
+                    output += QStringLiteral("Auth connection fingerprint: ") + authResult.hostKeyFingerprint + QStringLiteral("\n");
+                }
+
+                if (authResult.success) {
+                    output += QStringLiteral("Status: SUCCESS\n");
+                    output += QStringLiteral("Message: ") + authResult.message + QStringLiteral("\n");
+                    output += QStringLiteral("Auth return code: ") + QString::number(authResult.authReturnCode) + QStringLiteral("\n\n");
+                    output += QStringLiteral("Saved session authentication works. Shell was NOT opened yet.\n\n");
+                    output += QStringLiteral("Next milestone:\n");
+                    output += QStringLiteral("- persistent SSH session object\n");
+                    output += QStringLiteral("- real terminal channel\n");
+                } else {
+                    output += QStringLiteral("Status: FAILED\n");
+                    output += QStringLiteral("Message: ") + authResult.message + QStringLiteral("\n");
+                    output += QStringLiteral("Auth return code: ") + QString::number(authResult.authReturnCode) + QStringLiteral("\n");
+                    output += QStringLiteral("libssh error code: ") + QString::number(authResult.sshErrorCode) + QStringLiteral("\n");
+                    output += QStringLiteral("Error: ") + authResult.error + QStringLiteral("\n\n");
+                    output += QStringLiteral("Check:\n");
+                    output += QStringLiteral("- saved password/private key is correct\n");
+                    output += QStringLiteral("- server still allows selected authentication method\n");
+                    output += QStringLiteral("- private key has no passphrase for this early test\n");
+                }
+            }
+        } else {
+            output += QStringLiteral("Connection flow stopped at known-host decision.\n");
+            output += QStringLiteral("Authentication was NOT attempted.\n");
+        }
+    } else {
+        output += QStringLiteral("Status: FAILED\n");
+        output += QStringLiteral("Message: ") + handshake.message + QStringLiteral("\n");
+        output += QStringLiteral("libssh error code: ") + QString::number(handshake.sshErrorCode) + QStringLiteral("\n");
+        output += QStringLiteral("Error: ") + handshake.error + QStringLiteral("\n\n");
+        output += QStringLiteral("Known-host result:\n");
+        output += QStringLiteral("Decision: Not checked because handshake failed\n\n");
+        output += QStringLiteral("Check:\n");
+        output += QStringLiteral("- host/IP is correct\n");
+        output += QStringLiteral("- port is correct\n");
+        output += QStringLiteral("- SSH server is reachable\n");
+        output += QStringLiteral("- firewall allows connection\n");
+    }
+
+    auto *terminalPlaceholder = new QTextEdit(this);
+    terminalPlaceholder->setReadOnly(true);
+    terminalPlaceholder->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    terminalPlaceholder->setPlainText(output);
+
+    const int tabIndex = m_tabs->addTab(terminalPlaceholder, session.name);
+    m_tabs->setCurrentIndex(tabIndex);
+
+    if (handshake.success && knownHostAllowed && authAttempted && authSuccessful) {
+        statusBar()->showMessage("Saved session authentication successful for " + tabTitle);
+    } else if (handshake.success && knownHostAllowed && authAttempted) {
+        statusBar()->showMessage("Saved session authentication failed for " + tabTitle);
+    } else if (handshake.success && knownHostAllowed) {
+        statusBar()->showMessage("Saved session handshake and known-host check successful for " + tabTitle);
+    } else if (handshake.success) {
+        statusBar()->showMessage("Saved session handshake successful, but known-host flow stopped for " + tabTitle);
+    } else {
+        statusBar()->showMessage("Saved session handshake failed for " + tabTitle);
+    }
+}
+
+void MainWindow::showSettingsDialog()
+{
+    ConfigManager config;
+    QString loadError;
+    AppSettings currentSettings = config.loadSettings(&loadError);
+
+    if (!loadError.isEmpty()) {
+        const ConfigInspection inspection = config.inspectConfig();
+
+        if (inspection.hasProblem) {
+            const bool recovered = showConfigRecoveryDialog(inspection);
+
+            if (!recovered) {
+                statusBar()->showMessage(QStringLiteral("Settings not opened because BetterTTY.json still needs recovery"));
+                return;
+            }
+
+            loadError.clear();
+            currentSettings = config.loadSettings(&loadError);
+
+            if (!loadError.isEmpty()) {
+                QMessageBox::warning(
+                    this,
+                    QStringLiteral("Could not load settings"),
+                    loadError
+                );
+                statusBar()->showMessage(QStringLiteral("Could not load settings after config recovery"));
+                return;
+            }
+        } else {
+            QMessageBox::warning(
+                this,
+                QStringLiteral("Could not load settings"),
+                loadError
+            );
+            statusBar()->showMessage(QStringLiteral("Could not load settings from BetterTTY.json"));
+            return;
+        }
+    }
+
+    SettingsDialog dialog(currentSettings, config.configFilePath(), this);
+
+    if (dialog.exec() != QDialog::Accepted) {
+        statusBar()->showMessage(QStringLiteral("Settings cancelled"));
+        return;
+    }
+
+    QString saveError;
+
+    const AppSettings newSettings = dialog.settings();
+
+    if (!config.saveSettings(newSettings, &saveError)) {
+        QMessageBox::warning(
+            this,
+            QStringLiteral("Could not save settings"),
+            saveError
+        );
+        statusBar()->showMessage(QStringLiteral("Could not save settings to BetterTTY.json"));
+        return;
+    }
+
+    applyAppTheme(newSettings.appTheme);
+    applyQuickToolbarVisibility(newSettings.showQuickToolbar);
+    AppLogger::setEnabled(newSettings.diagnosticLoggingEnabled);
+    updateLoggingStatusIndicator();
+    AppLogger::info(QStringLiteral("Settings saved"));
+    statusBar()->showMessage(newSettings.diagnosticLoggingEnabled
+        ? QStringLiteral("Settings saved. Diagnostic logging enabled.")
+        : QStringLiteral("Settings saved. Diagnostic logging disabled."));
+}
+
+void MainWindow::showNewSessionDialog()
+{
+    showConnectDialog(true);
+}
+
+void MainWindow::showManualConnectDialog()
+{
+    showConnectDialog(false);
+}
+
+void MainWindow::showConnectDialog(bool newSavedSessionMode)
+{
+    ConnectDialog dialog(this);
+    dialog.setDialogMode(newSavedSessionMode
+        ? ConnectDialog::DialogMode::NewSession
+        : ConnectDialog::DialogMode::ManualConnect);
+
+    if (dialog.exec() != QDialog::Accepted) {
+        AppLogger::info(newSavedSessionMode
+            ? QStringLiteral("New session dialog cancelled")
+            : QStringLiteral("Manual connect dialog cancelled"));
+        statusBar()->showMessage(newSavedSessionMode ? "New session dialog cancelled" : "Manual connect dialog cancelled");
+        return;
+    }
+
+    const QString tabTitle =
+        dialog.username()
+        + QStringLiteral("@")
+        + dialog.host()
+        + QStringLiteral(":")
+        + QString::number(dialog.port());
+
+    AppLogger::info((newSavedSessionMode ? QStringLiteral("New saved session test requested: ") : QStringLiteral("Manual connection test requested: "))
+        + QStringLiteral("host=") + dialog.host()
+        + QStringLiteral(", port=") + QString::number(dialog.port())
+        + QStringLiteral(", user=") + dialog.username()
+        + QStringLiteral(", auth=") + (dialog.authType() == ConnectDialog::AuthType::Password ? QStringLiteral("password") : QStringLiteral("private-key")));
+
+    statusBar()->showMessage("Testing SSH handshake with " + tabTitle + "...");
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    QApplication::processEvents();
+
+    const SshHandshakeResult handshake = SshSession::testHandshake(
+        dialog.host(),
+        dialog.port(),
+        dialog.username()
+    );
+
+    QApplication::restoreOverrideCursor();
+
+    const QString authLabel =
+        dialog.authType() == ConnectDialog::AuthType::Password
+            ? QStringLiteral("Password")
+            : QStringLiteral("Private key");
+
+    const QString secretInfo =
+        dialog.authType() == ConnectDialog::AuthType::Password
+            ? QStringLiteral("Password: entered, hidden from display")
+            : QStringLiteral("Private key: ") + dialog.keyPath();
+
+    KnownHostsManager knownHosts;
+
+    bool knownHostAllowed = false;
+    QString knownHostDecision = QStringLiteral("Not checked");
+    QString knownHostExtra;
+
+    if (handshake.success) {
+        const KnownHostsManager::CheckResult check = knownHosts.checkHost(
+            dialog.host(),
+            dialog.port(),
+            handshake.hostKeyType,
+            handshake.hostKeyFingerprint
+        );
+
+        const KnownHostDecisionResult knownHostResult = promptKnownHostDecision(
+            this,
+            knownHosts,
+            check,
+            dialog.host(),
+            dialog.port(),
+            handshake.hostKeyType,
+            handshake.hostKeyFingerprint,
+            false
+        );
+
+        knownHostAllowed = knownHostResult.allowed;
+        knownHostDecision = knownHostResult.decision;
+        knownHostExtra = knownHostResult.extra;
+    }
+
+    QString output;
+
+    output += newSavedSessionMode
+        ? QStringLiteral("BetterTTY new saved session auth test\n\n")
+        : QStringLiteral("BetterTTY manual connection test\n\n");
+    output += QStringLiteral("Host: ") + dialog.host() + QStringLiteral("\n");
+    output += QStringLiteral("Port: ") + QString::number(dialog.port()) + QStringLiteral("\n");
+    output += QStringLiteral("Username: ") + dialog.username() + QStringLiteral("\n");
+    output += QStringLiteral("Auth type: ") + authLabel + QStringLiteral("\n");
+    output += secretInfo + QStringLiteral("\n\n");
+
+    output += QStringLiteral("SSH handshake result:\n");
+
+    bool authAttempted = false;
+    bool authSuccessful = false;
+    bool sessionSaveAttempted = false;
+    bool sessionSaved = false;
+    bool sessionUpdatedExisting = false;
+    bool sessionSaveCancelled = false;
+    bool sessionSavedAsCopy = false;
+    QString sessionSaveMessage;
+    SshAuthResult authResult;
+
+    if (handshake.success) {
+        output += QStringLiteral("Status: SUCCESS\n");
+        output += QStringLiteral("Message: ") + handshake.message + QStringLiteral("\n");
+        output += QStringLiteral("Server banner: ") + handshake.serverBanner + QStringLiteral("\n");
+        output += QStringLiteral("Host key type: ") + handshake.hostKeyType + QStringLiteral("\n");
+        output += QStringLiteral("Host key fingerprint: ") + handshake.hostKeyFingerprint + QStringLiteral("\n\n");
+
+        output += QStringLiteral("Known-host result:\n");
+        output += QStringLiteral("Decision: ") + knownHostDecision + QStringLiteral("\n");
+        output += QStringLiteral("Config file: ") + knownHosts.configFilePath() + QStringLiteral("\n");
+
+        if (!knownHostExtra.isEmpty()) {
+            output += QStringLiteral("Extra: ") + knownHostExtra + QStringLiteral("\n");
+        }
+
+        output += QStringLiteral("\n");
+
+        if (knownHostAllowed) {
+            output += QStringLiteral("Known-host decision allows continuing.\n\n");
+
+            const SshAuthMethod authMethod =
+                dialog.authType() == ConnectDialog::AuthType::Password
+                    ? SshAuthMethod::Password
+                    : SshAuthMethod::PrivateKey;
+
+            statusBar()->showMessage("Testing SSH authentication with " + tabTitle + "...");
+            QApplication::setOverrideCursor(Qt::WaitCursor);
+            QApplication::processEvents();
+
+            const SshHostKeyExpectation hostKeyExpectation = makeHostKeyExpectation(
+                dialog.host(),
+                dialog.port(),
+                handshake.hostKeyType,
+                handshake.hostKeyFingerprint,
+                knownHostDecision
+            );
+
+            authResult = SshSession::testAuthentication(
+                dialog.host(),
+                dialog.port(),
+                dialog.username(),
+                authMethod,
+                dialog.password(),
+                dialog.keyPath(),
+                hostKeyExpectation
+            );
+
+            QApplication::restoreOverrideCursor();
+
+            authAttempted = true;
+            authSuccessful = authResult.success;
+
+            output += QStringLiteral("Authentication result:\n");
+
+            if (authResult.hostKeyVerificationAttempted) {
+                output += QStringLiteral("Host-key verification before auth: ")
+                    + (authResult.hostKeyVerified ? QStringLiteral("VERIFIED") : QStringLiteral("FAILED"))
+                    + QStringLiteral("\n");
+                output += QStringLiteral("Auth connection key type: ") + authResult.hostKeyType + QStringLiteral("\n");
+                output += QStringLiteral("Auth connection fingerprint: ") + authResult.hostKeyFingerprint + QStringLiteral("\n");
+            }
+
+            if (authResult.success) {
+                output += QStringLiteral("Status: SUCCESS\n");
+                output += QStringLiteral("Message: ") + authResult.message + QStringLiteral("\n");
+                output += QStringLiteral("Auth return code: ") + QString::number(authResult.authReturnCode) + QStringLiteral("\n\n");
+
+                if (dialog.saveConnection()) {
+                    sessionSaveAttempted = true;
+
+                    ConfigManager config;
+                    SessionProfile session;
+                    session.name = dialog.sessionName();
+                    session.group = dialog.groupName();
+                    session.host = dialog.host();
+                    session.port = dialog.port();
+                    session.username = dialog.username();
+                    session.id = ConfigManager::makeSessionId(
+                        session.name,
+                        session.host,
+                        session.port,
+                        session.username
+                    );
+
+                    QString secretValue;
+
+                    if (dialog.authType() == ConnectDialog::AuthType::PrivateKey) {
+                        session.authType = SessionProfile::AuthType::PrivateKey;
+
+                        QString expandedKeyPath = dialog.keyPath();
+
+                        if (expandedKeyPath.startsWith(QStringLiteral("~/"))) {
+                            expandedKeyPath = QDir::homePath() + expandedKeyPath.mid(1);
+                        }
+
+                        QFile keyFile(expandedKeyPath);
+
+                        if (keyFile.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                            secretValue = QString::fromUtf8(keyFile.readAll());
+                            keyFile.close();
+                        } else {
+                            sessionSaveMessage = QStringLiteral("Could not read private key file for JSON save: ") + keyFile.errorString();
+                        }
+                    } else {
+                        session.authType = SessionProfile::AuthType::Password;
+                        secretValue = dialog.password();
+                    }
+
+                    if (sessionSaveMessage.isEmpty()) {
+                        QString duplicateCheckError;
+                        const QList<SessionProfile> duplicateTargetSessions = config.findSessionsByTarget(
+                            session.host,
+                            session.port,
+                            session.username,
+                            QString(),
+                            &duplicateCheckError
+                        );
+
+                        if (!duplicateCheckError.isEmpty()) {
+                            sessionSaveMessage = QStringLiteral("Could not check for duplicate saved sessions: ")
+                                + duplicateCheckError;
+                        } else if (!duplicateTargetSessions.isEmpty()) {
+                            const SessionProfile existingSession = duplicateTargetSessions.first();
+                            const QString target =
+                                session.username
+                                + QStringLiteral("@")
+                                + session.host
+                                + QStringLiteral(":")
+                                + QString::number(session.port);
+
+                            QMessageBox duplicateBox(this);
+                            duplicateBox.setIcon(QMessageBox::Question);
+                            duplicateBox.setWindowTitle("Saved session already exists");
+                            duplicateBox.setText("A session for " + target + " already exists.");
+
+                            QString duplicateInfo =
+                                QStringLiteral("Existing session: ") + existingSession.name + QStringLiteral("\n")
+                                + QStringLiteral("Existing session id: ") + existingSession.id + QStringLiteral("\n")
+                                + QStringLiteral("New session name: ") + session.name + QStringLiteral("\n\n")
+                                + QStringLiteral("What do you want to do?");
+
+                            if (duplicateTargetSessions.size() > 1) {
+                                duplicateInfo +=
+                                    QStringLiteral("\n\nNote: there are ")
+                                    + QString::number(duplicateTargetSessions.size())
+                                    + QStringLiteral(" saved sessions for this same target. Update existing will update the first match shown above.");
+                            }
+
+                            duplicateBox.setInformativeText(duplicateInfo);
+
+                            QAbstractButton *updateExistingButton = duplicateBox.addButton(
+                                "Update existing",
+                                QMessageBox::AcceptRole
+                            );
+                            QAbstractButton *createCopyButton = duplicateBox.addButton(
+                                "Create copy",
+                                QMessageBox::ActionRole
+                            );
+                            QAbstractButton *cancelButton = duplicateBox.addButton(
+                                "Cancel",
+                                QMessageBox::RejectRole
+                            );
+
+                            duplicateBox.setDefaultButton(qobject_cast<QPushButton *>(cancelButton));
+                            duplicateBox.exec();
+
+                            if (duplicateBox.clickedButton() == updateExistingButton) {
+                                QString updateError;
+                                bool changedSessionId = false;
+
+                                sessionSaved = config.updateSessionWithOptionalPlainSecret(
+                                    existingSession.id,
+                                    session,
+                                    secretValue,
+                                    true,
+                                    &updateError,
+                                    &changedSessionId
+                                );
+
+                                sessionUpdatedExisting = sessionSaved;
+
+                                if (sessionSaved) {
+                                    sessionSaveMessage = changedSessionId
+                                        ? QStringLiteral("Updated existing session and changed its session id in ") + config.configFilePath()
+                                        : QStringLiteral("Updated existing session in ") + config.configFilePath();
+                                    loadSavedSessionsToSidebar();
+                                } else {
+                                    sessionSaveMessage = updateError;
+                                }
+                            } else if (duplicateBox.clickedButton() == createCopyButton) {
+                                SessionProfile copySession = session;
+                                QString uniqueIdError;
+                                QString uniqueSessionId = config.makeUniqueSessionId(
+                                    copySession.id,
+                                    QString(),
+                                    &uniqueIdError
+                                );
+
+                                if (!uniqueIdError.isEmpty()) {
+                                    sessionSaveMessage = QStringLiteral("Could not prepare unique session id: ")
+                                        + uniqueIdError;
+                                } else {
+                                    if (uniqueSessionId != copySession.id) {
+                                        copySession.name = copySession.name.trimmed() + QStringLiteral(" (copy)");
+                                        copySession.id = ConfigManager::makeSessionId(
+                                            copySession.name,
+                                            copySession.host,
+                                            copySession.port,
+                                            copySession.username
+                                        );
+                                        uniqueSessionId = config.makeUniqueSessionId(
+                                            copySession.id,
+                                            QString(),
+                                            &uniqueIdError
+                                        );
+
+                                        if (!uniqueIdError.isEmpty()) {
+                                            sessionSaveMessage = QStringLiteral("Could not prepare copy session id: ")
+                                                + uniqueIdError;
+                                        } else {
+                                            copySession.id = uniqueSessionId;
+                                        }
+                                    } else {
+                                        copySession.id = uniqueSessionId;
+                                    }
+
+                                    if (sessionSaveMessage.isEmpty()) {
+                                        QString saveError;
+
+                                        sessionSaved = config.saveSessionWithPlainSecret(
+                                            copySession,
+                                            secretValue,
+                                            &saveError,
+                                            &sessionUpdatedExisting
+                                        );
+
+                                        sessionSavedAsCopy = sessionSaved;
+
+                                        if (sessionSaved) {
+                                            sessionSaveMessage = QStringLiteral("Created copy as new session '")
+                                                + copySession.name
+                                                + QStringLiteral("' in ")
+                                                + config.configFilePath();
+                                            loadSavedSessionsToSidebar();
+                                        } else {
+                                            sessionSaveMessage = saveError;
+                                        }
+                                    }
+                                }
+                            } else {
+                                sessionSaveCancelled = true;
+                                sessionSaveMessage = QStringLiteral("User cancelled saving because a matching saved session already exists.");
+                            }
+                        } else {
+                            QString saveError;
+
+                            sessionSaved = config.saveSessionWithPlainSecret(
+                                session,
+                                secretValue,
+                                &saveError,
+                                &sessionUpdatedExisting
+                            );
+
+                            if (sessionSaved) {
+                                sessionSaveMessage = sessionUpdatedExisting
+                                    ? QStringLiteral("Updated existing session in ") + config.configFilePath()
+                                    : QStringLiteral("Created new session in ") + config.configFilePath();
+                                loadSavedSessionsToSidebar();
+                            } else {
+                                sessionSaveMessage = saveError;
+                            }
+                        }
+                    }
+                }
+
+                if (sessionSaveAttempted) {
+                    output += QStringLiteral("Session save result:\n");
+
+                    if (sessionSaveCancelled) {
+                        output += QStringLiteral("Status: CANCELLED\n");
+                    } else if (sessionSavedAsCopy) {
+                        output += QStringLiteral("Status: CREATED COPY\n");
+                    } else if (sessionSaved) {
+                        output += sessionUpdatedExisting
+                            ? QStringLiteral("Status: UPDATED EXISTING SESSION\n")
+                            : QStringLiteral("Status: CREATED NEW SESSION\n");
+                    } else {
+                        output += QStringLiteral("Status: FAILED\n");
+                    }
+
+                    output += QStringLiteral("Message: ") + sessionSaveMessage + QStringLiteral("\n");
+                    output += QStringLiteral("Secrets mode: plain-v1 plaintext portable storage\n\n");
+                } else {
+                    output += QStringLiteral("Session save result:\n");
+                    output += QStringLiteral("Status: SKIPPED - Save this connection was not checked.\n\n");
+                }
+
+                output += QStringLiteral("Authentication works. Shell was NOT opened yet.\n\n");
+                output += QStringLiteral("Next milestone:\n");
+                output += QStringLiteral("- persistent SSH session object\n");
+                output += QStringLiteral("- real terminal channel\n");
+            } else {
+                output += QStringLiteral("Status: FAILED\n");
+                output += QStringLiteral("Message: ") + authResult.message + QStringLiteral("\n");
+                output += QStringLiteral("Auth return code: ") + QString::number(authResult.authReturnCode) + QStringLiteral("\n");
+                output += QStringLiteral("libssh error code: ") + QString::number(authResult.sshErrorCode) + QStringLiteral("\n");
+                output += QStringLiteral("Error: ") + authResult.error + QStringLiteral("\n\n");
+
+                output += QStringLiteral("Check:\n");
+                output += QStringLiteral("- username is correct\n");
+                output += QStringLiteral("- password/private key is correct\n");
+                output += QStringLiteral("- server allows selected authentication method\n");
+                output += QStringLiteral("- private key has no passphrase for this early test\n");
+            }
+        } else {
+            output += QStringLiteral("Connection flow stopped at known-host decision.\n");
+            output += QStringLiteral("Authentication was NOT attempted.\n");
+        }
+    } else {
+        output += QStringLiteral("Status: FAILED\n");
+        output += QStringLiteral("Message: ") + handshake.message + QStringLiteral("\n");
+        output += QStringLiteral("libssh error code: ") + QString::number(handshake.sshErrorCode) + QStringLiteral("\n");
+        output += QStringLiteral("Error: ") + handshake.error + QStringLiteral("\n\n");
+        output += QStringLiteral("Known-host result:\n");
+        output += QStringLiteral("Decision: Not checked because handshake failed\n\n");
+        output += QStringLiteral("Check:\n");
+        output += QStringLiteral("- host/IP is correct\n");
+        output += QStringLiteral("- port is correct\n");
+        output += QStringLiteral("- SSH server is reachable\n");
+        output += QStringLiteral("- firewall allows connection\n");
+    }
+
+    auto *terminalPlaceholder = new QTextEdit(this);
+    terminalPlaceholder->setReadOnly(true);
+    terminalPlaceholder->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
+    terminalPlaceholder->setPlainText(output);
+
+    const int tabIndex = m_tabs->addTab(terminalPlaceholder, tabTitle);
+    m_tabs->setCurrentIndex(tabIndex);
+
+    if (handshake.success && knownHostAllowed && authAttempted && authSuccessful) {
+        if (sessionSaveAttempted && sessionSaveCancelled) {
+            statusBar()->showMessage("SSH authentication successful; session save cancelled for " + tabTitle);
+        } else if (sessionSaveAttempted && sessionSaved) {
+            if (sessionSavedAsCopy) {
+                statusBar()->showMessage("SSH authentication successful and session copy created for " + tabTitle);
+            } else {
+                statusBar()->showMessage(
+                    sessionUpdatedExisting
+                        ? QStringLiteral("SSH authentication successful and session updated for ") + tabTitle
+                        : QStringLiteral("SSH authentication successful and session created for ") + tabTitle
+                );
+            }
+        } else if (sessionSaveAttempted) {
+            statusBar()->showMessage("SSH authentication successful, but session save failed for " + tabTitle);
+        } else {
+            statusBar()->showMessage("SSH authentication successful for " + tabTitle);
+        }
+    } else if (handshake.success && knownHostAllowed && authAttempted) {
+        statusBar()->showMessage("SSH authentication failed for " + tabTitle);
+    } else if (handshake.success && knownHostAllowed) {
+        statusBar()->showMessage("SSH handshake and known-host check successful for " + tabTitle);
+    } else if (handshake.success) {
+        statusBar()->showMessage("SSH handshake successful, but known-host flow stopped for " + tabTitle);
+    } else {
+        statusBar()->showMessage("SSH handshake failed for " + tabTitle);
+    }
+}

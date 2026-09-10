@@ -1,0 +1,1760 @@
+#include "SftpProbe.h"
+#include "ssh/SshCompatibility.h"
+#include "core/AppLogger.h"
+
+#include <libssh/libssh.h>
+#include <libssh/sftp.h>
+
+#include <QByteArray>
+#include <QDateTime>
+#include <QDir>
+#include <QFile>
+#include <QFileDevice>
+#include <QFileInfo>
+#include <QSaveFile>
+#include <QTemporaryFile>
+
+#include <cstdint>
+#include <fcntl.h>
+
+namespace {
+
+QString fileTypeLabel(int type)
+{
+    switch (type) {
+    case SSH_FILEXFER_TYPE_REGULAR:
+        return QStringLiteral("file");
+    case SSH_FILEXFER_TYPE_DIRECTORY:
+        return QStringLiteral("directory");
+    case SSH_FILEXFER_TYPE_SYMLINK:
+        return QStringLiteral("symlink");
+    case SSH_FILEXFER_TYPE_SPECIAL:
+        return QStringLiteral("special");
+    case SSH_FILEXFER_TYPE_UNKNOWN:
+    default:
+        return QStringLiteral("unknown");
+    }
+}
+
+QString permissionString(uint32_t permissions)
+{
+    if (permissions == 0) {
+        return QStringLiteral("(unknown)");
+    }
+
+    return QStringLiteral("0") + QStringLiteral("%1")
+        .arg(static_cast<unsigned int>(permissions & 07777U), 4, 8, QLatin1Char('0'));
+}
+
+QString timestampString(uint32_t timestamp)
+{
+    if (timestamp == 0) {
+        return QStringLiteral("(unknown)");
+    }
+
+    return QDateTime::fromSecsSinceEpoch(static_cast<qint64>(timestamp)).toString(Qt::ISODate);
+}
+
+bool readConnectedServerHostKey(
+    ssh_session session,
+    QString *keyType,
+    QString *fingerprint,
+    QString *errorMessage
+)
+{
+    if (keyType != nullptr) {
+        *keyType = QString();
+    }
+
+    if (fingerprint != nullptr) {
+        *fingerprint = QString();
+    }
+
+    if (errorMessage != nullptr) {
+        *errorMessage = QString();
+    }
+
+    ssh_key serverPublicKey = nullptr;
+    const int keyRc = ssh_get_server_publickey(session, &serverPublicKey);
+
+    if (keyRc != SSH_OK || serverPublicKey == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Could not read SSH server host key: ")
+                + QString::fromUtf8(ssh_get_error(session));
+        }
+
+        return false;
+    }
+
+    const char *rawKeyType = ssh_key_type_to_char(ssh_key_type(serverPublicKey));
+
+    if (rawKeyType != nullptr) {
+        if (keyType != nullptr) {
+            *keyType = QString::fromUtf8(rawKeyType);
+        }
+    } else if (keyType != nullptr) {
+        *keyType = QStringLiteral("unknown");
+    }
+
+    unsigned char *hash = nullptr;
+    size_t hashLength = 0;
+
+    const int hashRc = ssh_get_publickey_hash(
+        serverPublicKey,
+        SSH_PUBLICKEY_HASH_SHA256,
+        &hash,
+        &hashLength
+    );
+
+    if (hashRc != SSH_OK || hash == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Could not calculate SSH server host-key fingerprint: ")
+                + QString::fromUtf8(ssh_get_error(session));
+        }
+
+        ssh_key_free(serverPublicKey);
+        return false;
+    }
+
+    char *rawFingerprint = ssh_get_fingerprint_hash(
+        SSH_PUBLICKEY_HASH_SHA256,
+        hash,
+        hashLength
+    );
+
+    ssh_clean_pubkey_hash(&hash);
+    ssh_key_free(serverPublicKey);
+
+    if (rawFingerprint == nullptr) {
+        if (errorMessage != nullptr) {
+            *errorMessage = QStringLiteral("Could not format SSH server host-key fingerprint.");
+        }
+
+        return false;
+    }
+
+    if (fingerprint != nullptr) {
+        *fingerprint = QString::fromUtf8(rawFingerprint);
+    }
+
+    ssh_string_free_char(rawFingerprint);
+    return true;
+}
+
+bool verifyConnectedServerHostKey(
+    ssh_session session,
+    const SshHostKeyExpectation &expectation,
+    SftpProbeResult *result
+)
+{
+    if (!expectation.enabled) {
+        return true;
+    }
+
+    if (result != nullptr) {
+        result->hostKeyVerificationAttempted = true;
+    }
+
+    QString currentKeyType;
+    QString currentFingerprint;
+    QString keyError;
+
+    if (!readConnectedServerHostKey(session, &currentKeyType, &currentFingerprint, &keyError)) {
+        if (result != nullptr) {
+            result->success = false;
+            result->message = QStringLiteral("SSH host key verification failed before SFTP authentication.");
+            result->error = keyError;
+            result->sshErrorCode = ssh_get_error_code(session);
+            result->hostKeyVerified = false;
+            result->hostKeyType = currentKeyType;
+            result->hostKeyFingerprint = currentFingerprint;
+        }
+
+        return false;
+    }
+
+    if (result != nullptr) {
+        result->hostKeyType = currentKeyType;
+        result->hostKeyFingerprint = currentFingerprint;
+    }
+
+    const bool matches =
+        currentKeyType == expectation.keyType
+        && currentFingerprint == expectation.fingerprint;
+
+    if (!matches) {
+        if (result != nullptr) {
+            result->success = false;
+            result->message = QStringLiteral("SSH host key verification failed before SFTP authentication.");
+            result->error =
+                QStringLiteral("The SFTP connection reported a different SSH host key than the key approved during the preflight check. Authentication was not attempted.\n")
+                + QStringLiteral("Expected host: ") + expectation.host + QStringLiteral(":") + QString::number(expectation.port) + QStringLiteral("\n")
+                + QStringLiteral("Expected key type: ") + expectation.keyType + QStringLiteral("\n")
+                + QStringLiteral("Expected fingerprint: ") + expectation.fingerprint + QStringLiteral("\n")
+                + QStringLiteral("Current key type: ") + currentKeyType + QStringLiteral("\n")
+                + QStringLiteral("Current fingerprint: ") + currentFingerprint;
+            result->sshErrorCode = ssh_get_error_code(session);
+            result->hostKeyVerified = false;
+        }
+
+        return false;
+    }
+
+    if (result != nullptr) {
+        result->hostKeyVerified = true;
+    }
+
+    return true;
+}
+
+bool authenticateSession(
+    ssh_session session,
+    const QString &username,
+    SshAuthMethod authMethod,
+    const QString &secretValue,
+    SftpProbeResult *result
+)
+{
+    const QByteArray usernameUtf8 = username.toUtf8();
+    int authRc = SSH_AUTH_DENIED;
+    QTemporaryFile tempKeyFile;
+
+    if (authMethod == SshAuthMethod::Password) {
+        const QByteArray passwordUtf8 = secretValue.toUtf8();
+        authRc = ssh_userauth_password(
+            session,
+            usernameUtf8.constData(),
+            passwordUtf8.constData()
+        );
+    } else {
+        tempKeyFile.setFileTemplate(QDir::tempPath() + QStringLiteral("/bettertty-sftp-key-XXXXXX"));
+        tempKeyFile.setAutoRemove(true);
+
+        if (!tempKeyFile.open()) {
+            if (result != nullptr) {
+                result->success = false;
+                result->message = QStringLiteral("Could not create temporary private key file for SFTP directory listing.");
+                result->error = tempKeyFile.errorString();
+                result->sshErrorCode = ssh_get_error_code(session);
+            }
+
+            return false;
+        }
+
+        tempKeyFile.write(secretValue.toUtf8());
+        tempKeyFile.flush();
+        tempKeyFile.setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        const QString keyPath = tempKeyFile.fileName();
+        tempKeyFile.close();
+
+        ssh_key privateKey = nullptr;
+        const QByteArray keyPathUtf8 = keyPath.toUtf8();
+
+        const int importRc = ssh_pki_import_privkey_file(
+            keyPathUtf8.constData(),
+            nullptr,
+            nullptr,
+            nullptr,
+            &privateKey
+        );
+
+        if (importRc != SSH_OK || privateKey == nullptr) {
+            if (result != nullptr) {
+                result->success = false;
+                result->message = QStringLiteral("Could not load private key for SFTP directory listing.");
+                result->authReturnCode = importRc;
+                result->sshErrorCode = ssh_get_error_code(session);
+                result->error = QString::fromUtf8(ssh_get_error(session));
+            }
+
+            return false;
+        }
+
+        authRc = ssh_userauth_publickey(
+            session,
+            usernameUtf8.constData(),
+            privateKey
+        );
+
+        ssh_key_free(privateKey);
+    }
+
+    if (result != nullptr) {
+        result->authReturnCode = authRc;
+    }
+
+    if (authRc != SSH_AUTH_SUCCESS) {
+        if (result != nullptr) {
+            result->success = false;
+            result->sshErrorCode = ssh_get_error_code(session);
+            result->error = QString::fromUtf8(ssh_get_error(session));
+
+            if (authRc == SSH_AUTH_DENIED) {
+                result->message = QStringLiteral("SFTP directory listing authentication denied by server.");
+            } else if (authRc == SSH_AUTH_PARTIAL) {
+                result->message = QStringLiteral("SFTP directory listing authentication partially successful; additional method required.");
+            } else if (authRc == SSH_AUTH_AGAIN) {
+                result->message = QStringLiteral("SFTP directory listing authentication needs to be retried.");
+            } else {
+                result->message = QStringLiteral("SFTP directory listing authentication failed.");
+            }
+        }
+
+        return false;
+    }
+
+    return true;
+}
+
+void copyProbeAuthFailure(const SftpProbeResult &source, SftpDownloadResult *target)
+{
+    if (target == nullptr) {
+        return;
+    }
+
+    target->success = source.success;
+    target->message = source.message;
+    target->error = source.error;
+    target->sshErrorCode = source.sshErrorCode;
+    target->authReturnCode = source.authReturnCode;
+    target->sftpErrorCode = source.sftpErrorCode;
+    target->hostKeyVerificationAttempted = source.hostKeyVerificationAttempted;
+    target->hostKeyVerified = source.hostKeyVerified;
+    target->hostKeyType = source.hostKeyType;
+    target->hostKeyFingerprint = source.hostKeyFingerprint;
+}
+
+bool verifyConnectedServerHostKeyForDownload(
+    ssh_session session,
+    const SshHostKeyExpectation &expectation,
+    SftpDownloadResult *result
+)
+{
+    SftpProbeResult probeResult;
+    const bool ok = verifyConnectedServerHostKey(session, expectation, &probeResult);
+
+    if (result != nullptr) {
+        copyProbeAuthFailure(probeResult, result);
+        if (!ok && result->message.isEmpty()) {
+            result->message = QStringLiteral("SSH host key verification failed before SFTP download authentication.");
+        }
+    }
+
+    return ok;
+}
+
+bool authenticateSessionForDownload(
+    ssh_session session,
+    const QString &username,
+    SshAuthMethod authMethod,
+    const QString &secretValue,
+    SftpDownloadResult *result
+)
+{
+    SftpProbeResult probeResult;
+    const bool ok = authenticateSession(session, username, authMethod, secretValue, &probeResult);
+
+    if (result != nullptr) {
+        result->authReturnCode = probeResult.authReturnCode;
+        result->sshErrorCode = probeResult.sshErrorCode;
+
+        if (!ok) {
+            result->success = false;
+            result->message = probeResult.message;
+            result->error = probeResult.error;
+            result->sftpErrorCode = probeResult.sftpErrorCode;
+
+            if (result->message.contains(QStringLiteral("directory listing"), Qt::CaseInsensitive)) {
+                result->message.replace(QStringLiteral("directory listing"), QStringLiteral("download"), Qt::CaseInsensitive);
+            }
+        }
+    }
+
+    return ok;
+}
+
+
+
+void copyProbeAuthFailureToMkdir(const SftpProbeResult &source, SftpMkdirResult *target)
+{
+    if (target == nullptr) {
+        return;
+    }
+
+    target->success = source.success;
+    target->message = source.message;
+    target->error = source.error;
+    target->sshErrorCode = source.sshErrorCode;
+    target->authReturnCode = source.authReturnCode;
+    target->sftpErrorCode = source.sftpErrorCode;
+    target->hostKeyVerificationAttempted = source.hostKeyVerificationAttempted;
+    target->hostKeyVerified = source.hostKeyVerified;
+    target->hostKeyType = source.hostKeyType;
+    target->hostKeyFingerprint = source.hostKeyFingerprint;
+}
+
+bool verifyConnectedServerHostKeyForMkdir(
+    ssh_session session,
+    const SshHostKeyExpectation &expectation,
+    SftpMkdirResult *result
+)
+{
+    SftpProbeResult probeResult;
+    const bool ok = verifyConnectedServerHostKey(session, expectation, &probeResult);
+
+    if (result != nullptr) {
+        copyProbeAuthFailureToMkdir(probeResult, result);
+        if (!ok && result->message.isEmpty()) {
+            result->message = QStringLiteral("SSH host key verification failed before SFTP mkdir authentication.");
+        }
+    }
+
+    return ok;
+}
+
+bool authenticateSessionForMkdir(
+    ssh_session session,
+    const QString &username,
+    SshAuthMethod authMethod,
+    const QString &secretValue,
+    SftpMkdirResult *result
+)
+{
+    SftpProbeResult probeResult;
+    const bool ok = authenticateSession(session, username, authMethod, secretValue, &probeResult);
+
+    if (result != nullptr) {
+        result->authReturnCode = probeResult.authReturnCode;
+        result->sshErrorCode = probeResult.sshErrorCode;
+
+        if (!ok) {
+            result->success = false;
+            result->message = probeResult.message;
+            result->error = probeResult.error;
+            result->sftpErrorCode = probeResult.sftpErrorCode;
+
+            if (result->message.contains(QStringLiteral("directory listing"), Qt::CaseInsensitive)) {
+                result->message.replace(QStringLiteral("directory listing"), QStringLiteral("mkdir"), Qt::CaseInsensitive);
+            }
+        }
+    }
+
+    return ok;
+}
+
+
+void copyProbeAuthFailureToDelete(const SftpProbeResult &source, SftpDeleteResult *target)
+{
+    if (target == nullptr) {
+        return;
+    }
+
+    target->success = source.success;
+    target->message = source.message;
+    target->error = source.error;
+    target->sshErrorCode = source.sshErrorCode;
+    target->authReturnCode = source.authReturnCode;
+    target->sftpErrorCode = source.sftpErrorCode;
+    target->hostKeyVerificationAttempted = source.hostKeyVerificationAttempted;
+    target->hostKeyVerified = source.hostKeyVerified;
+    target->hostKeyType = source.hostKeyType;
+    target->hostKeyFingerprint = source.hostKeyFingerprint;
+}
+
+bool verifyConnectedServerHostKeyForDelete(
+    ssh_session session,
+    const SshHostKeyExpectation &expectation,
+    SftpDeleteResult *result
+)
+{
+    SftpProbeResult probeResult;
+    const bool ok = verifyConnectedServerHostKey(session, expectation, &probeResult);
+
+    if (result != nullptr) {
+        copyProbeAuthFailureToDelete(probeResult, result);
+        if (!ok && result->message.isEmpty()) {
+            result->message = QStringLiteral("SSH host key verification failed before SFTP delete authentication.");
+        }
+    }
+
+    return ok;
+}
+
+bool authenticateSessionForDelete(
+    ssh_session session,
+    const QString &username,
+    SshAuthMethod authMethod,
+    const QString &secretValue,
+    SftpDeleteResult *result
+)
+{
+    SftpProbeResult probeResult;
+    const bool ok = authenticateSession(session, username, authMethod, secretValue, &probeResult);
+
+    if (result != nullptr) {
+        result->authReturnCode = probeResult.authReturnCode;
+        result->sshErrorCode = probeResult.sshErrorCode;
+
+        if (!ok) {
+            result->success = false;
+            result->message = probeResult.message;
+            result->error = probeResult.error;
+            result->sftpErrorCode = probeResult.sftpErrorCode;
+
+            if (result->message.contains(QStringLiteral("directory listing"), Qt::CaseInsensitive)) {
+                result->message.replace(QStringLiteral("directory listing"), QStringLiteral("delete"), Qt::CaseInsensitive);
+            }
+        }
+    }
+
+    return ok;
+}
+
+void copyProbeAuthFailureToUpload(const SftpProbeResult &source, SftpUploadResult *target)
+{
+    if (target == nullptr) {
+        return;
+    }
+
+    target->success = source.success;
+    target->message = source.message;
+    target->error = source.error;
+    target->sshErrorCode = source.sshErrorCode;
+    target->authReturnCode = source.authReturnCode;
+    target->sftpErrorCode = source.sftpErrorCode;
+    target->hostKeyVerificationAttempted = source.hostKeyVerificationAttempted;
+    target->hostKeyVerified = source.hostKeyVerified;
+    target->hostKeyType = source.hostKeyType;
+    target->hostKeyFingerprint = source.hostKeyFingerprint;
+}
+
+bool verifyConnectedServerHostKeyForUpload(
+    ssh_session session,
+    const SshHostKeyExpectation &expectation,
+    SftpUploadResult *result
+)
+{
+    SftpProbeResult probeResult;
+    const bool ok = verifyConnectedServerHostKey(session, expectation, &probeResult);
+
+    if (result != nullptr) {
+        copyProbeAuthFailureToUpload(probeResult, result);
+        if (!ok && result->message.isEmpty()) {
+            result->message = QStringLiteral("SSH host key verification failed before SFTP upload authentication.");
+        }
+    }
+
+    return ok;
+}
+
+bool authenticateSessionForUpload(
+    ssh_session session,
+    const QString &username,
+    SshAuthMethod authMethod,
+    const QString &secretValue,
+    SftpUploadResult *result
+)
+{
+    SftpProbeResult probeResult;
+    const bool ok = authenticateSession(session, username, authMethod, secretValue, &probeResult);
+
+    if (result != nullptr) {
+        result->authReturnCode = probeResult.authReturnCode;
+        result->sshErrorCode = probeResult.sshErrorCode;
+
+        if (!ok) {
+            result->success = false;
+            result->message = probeResult.message;
+            result->error = probeResult.error;
+            result->sftpErrorCode = probeResult.sftpErrorCode;
+
+            if (result->message.contains(QStringLiteral("directory listing"), Qt::CaseInsensitive)) {
+                result->message.replace(QStringLiteral("directory listing"), QStringLiteral("upload"), Qt::CaseInsensitive);
+            }
+        }
+    }
+
+    return ok;
+}
+
+} // namespace
+
+SftpProbeResult SftpProbe::listRemoteDirectory(
+    const QString &host,
+    int port,
+    const QString &username,
+    SshAuthMethod authMethod,
+    const QString &secretValue,
+    const SshHostKeyExpectation &hostKeyExpectation,
+    const QString &remotePath
+)
+{
+    SftpProbeResult result;
+    result.remotePath = remotePath.trimmed().isEmpty() ? QStringLiteral(".") : remotePath.trimmed();
+
+    AppLogger::info(QStringLiteral("SFTP directory listing started: host=") + host
+        + QStringLiteral(", port=") + QString::number(port)
+        + QStringLiteral(", user=") + username
+        + QStringLiteral(", method=") + (authMethod == SshAuthMethod::Password ? QStringLiteral("password") : QStringLiteral("private-key")));
+
+    ssh_session session = ssh_new();
+
+    if (session == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP directory listing failed before connect.");
+        result.error = QStringLiteral("ssh_new() failed: could not allocate SSH session.");
+        AppLogger::error(QStringLiteral("SFTP directory listing failed before connect: ssh_new failed"));
+        return result;
+    }
+
+    const QByteArray hostUtf8 = host.toUtf8();
+    const QByteArray usernameUtf8 = username.toUtf8();
+
+    int verbosity = SshCompatibility::defaultLogVerbosity();
+    long timeoutSeconds = 10;
+
+    ssh_options_set(session, SSH_OPTIONS_HOST, hostUtf8.constData());
+    ssh_options_set(session, SSH_OPTIONS_PORT, &port);
+    ssh_options_set(session, SSH_OPTIONS_USER, usernameUtf8.constData());
+    ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
+    ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeoutSeconds);
+    SshCompatibility::applySessionCompatibility(session);
+
+    const int connectRc = ssh_connect(session);
+
+    if (connectRc != SSH_OK) {
+        result.success = false;
+        result.message = QStringLiteral("SSH connect failed during SFTP directory listing.");
+        result.sshErrorCode = ssh_get_error_code(session);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP directory listing connect failed: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", error=") + result.error);
+        ssh_free(session);
+        return result;
+    }
+
+    if (!verifyConnectedServerHostKey(session, hostKeyExpectation, &result)) {
+        AppLogger::error(QStringLiteral("SFTP directory listing host-key verification failed before auth: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", error=") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    if (hostKeyExpectation.enabled) {
+        AppLogger::info(QStringLiteral("SFTP directory listing host-key verification OK: host=") + host
+            + QStringLiteral(", port=") + QString::number(port));
+    }
+
+    if (!authenticateSession(session, username, authMethod, secretValue, &result)) {
+        AppLogger::warn(QStringLiteral("SFTP directory listing authentication failed: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", message=") + result.message
+            + QStringLiteral(", error=") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    AppLogger::info(QStringLiteral("SFTP directory listing authentication successful: host=") + host
+        + QStringLiteral(", port=") + QString::number(port));
+
+    sftp_session sftp = sftp_new(session);
+
+    if (sftp == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("Could not allocate SFTP session.");
+        result.sshErrorCode = ssh_get_error_code(session);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP directory listing allocation failed: ") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    const int initRc = sftp_init(sftp);
+
+    if (initRc != SSH_OK) {
+        result.success = false;
+        result.message = QStringLiteral("Could not initialize SFTP subsystem.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP directory listing subsystem init failed: ") + result.error
+            + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode));
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    const QByteArray pathUtf8 = result.remotePath.toUtf8();
+    sftp_dir directory = sftp_opendir(sftp, pathUtf8.constData());
+
+    if (directory == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("Could not open remote directory for SFTP directory listing.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP directory listing opendir failed: sftpError=") + QString::number(result.sftpErrorCode)
+            + QStringLiteral(", error=") + result.error);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    while (true) {
+        sftp_attributes attributes = sftp_readdir(sftp, directory);
+
+        if (attributes == nullptr) {
+            break;
+        }
+
+        SftpRemoteEntry entry;
+        entry.name = attributes->name != nullptr ? QString::fromUtf8(attributes->name) : QStringLiteral("(unnamed)");
+        entry.type = fileTypeLabel(attributes->type);
+        entry.sizeBytes = static_cast<quint64>(attributes->size);
+        entry.modifiedTime = timestampString(attributes->mtime);
+        entry.permissions = permissionString(attributes->permissions);
+        result.entries.append(entry);
+
+        sftp_attributes_free(attributes);
+    }
+
+    const bool reachedEnd = sftp_dir_eof(directory) != 0;
+
+    if (!reachedEnd) {
+        result.success = false;
+        result.message = QStringLiteral("Remote directory listing stopped before EOF.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::warn(QStringLiteral("SFTP directory listing readdir stopped before EOF: sftpError=") + QString::number(result.sftpErrorCode)
+            + QStringLiteral(", error=") + result.error);
+        sftp_closedir(directory);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    sftp_closedir(directory);
+    sftp_free(sftp);
+    ssh_disconnect(session);
+    ssh_free(session);
+
+    result.success = true;
+    result.message = QStringLiteral("SFTP subsystem initialized and remote directory listed successfully.");
+
+    AppLogger::info(QStringLiteral("SFTP directory listing successful: host=") + host
+        + QStringLiteral(", port=") + QString::number(port)
+        + QStringLiteral(", entries=") + QString::number(result.entries.size()));
+
+    return result;
+}
+
+
+SftpMkdirResult SftpProbe::createRemoteDirectory(
+    const QString &host,
+    int port,
+    const QString &username,
+    SshAuthMethod authMethod,
+    const QString &secretValue,
+    const SshHostKeyExpectation &hostKeyExpectation,
+    const QString &remotePath
+)
+{
+    SftpMkdirResult result;
+    result.remotePath = remotePath.trimmed();
+
+    if (result.remotePath.isEmpty() || result.remotePath == QStringLiteral(".")) {
+        result.success = true;
+        result.alreadyExists = true;
+        result.message = QStringLiteral("Remote directory already exists or is the current directory.");
+        return result;
+    }
+
+    AppLogger::info(QStringLiteral("SFTP mkdir started: host=") + host
+        + QStringLiteral(", port=") + QString::number(port)
+        + QStringLiteral(", user=") + username
+        + QStringLiteral(", path=") + result.remotePath);
+
+    ssh_session session = ssh_new();
+
+    if (session == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP mkdir failed before connect.");
+        result.error = QStringLiteral("ssh_new() failed: could not allocate SSH session.");
+        AppLogger::error(QStringLiteral("SFTP mkdir failed before connect: ssh_new failed"));
+        return result;
+    }
+
+    const QByteArray hostUtf8 = host.toUtf8();
+    const QByteArray usernameUtf8 = username.toUtf8();
+
+    int verbosity = SshCompatibility::defaultLogVerbosity();
+    long timeoutSeconds = 10;
+
+    ssh_options_set(session, SSH_OPTIONS_HOST, hostUtf8.constData());
+    ssh_options_set(session, SSH_OPTIONS_PORT, &port);
+    ssh_options_set(session, SSH_OPTIONS_USER, usernameUtf8.constData());
+    ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
+    ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeoutSeconds);
+    SshCompatibility::applySessionCompatibility(session);
+
+    const int connectRc = ssh_connect(session);
+
+    if (connectRc != SSH_OK) {
+        result.success = false;
+        result.message = QStringLiteral("SSH connect failed during SFTP mkdir.");
+        result.sshErrorCode = ssh_get_error_code(session);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP mkdir connect failed: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", error=") + result.error);
+        ssh_free(session);
+        return result;
+    }
+
+    if (!verifyConnectedServerHostKeyForMkdir(session, hostKeyExpectation, &result)) {
+        AppLogger::error(QStringLiteral("SFTP mkdir host-key verification failed before auth: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", error=") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    if (!authenticateSessionForMkdir(session, username, authMethod, secretValue, &result)) {
+        AppLogger::warn(QStringLiteral("SFTP mkdir authentication failed: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", message=") + result.message
+            + QStringLiteral(", error=") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    sftp_session sftp = sftp_new(session);
+
+    if (sftp == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("Could not allocate SFTP session for mkdir.");
+        result.sshErrorCode = ssh_get_error_code(session);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP mkdir allocation failed: ") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    const int initRc = sftp_init(sftp);
+
+    if (initRc != SSH_OK) {
+        result.success = false;
+        result.message = QStringLiteral("Could not initialize SFTP subsystem for mkdir.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP mkdir subsystem init failed: ") + result.error
+            + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode));
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    const QByteArray pathUtf8 = result.remotePath.toUtf8();
+    sftp_attributes existing = sftp_stat(sftp, pathUtf8.constData());
+
+    if (existing != nullptr) {
+        if (existing->type == SSH_FILEXFER_TYPE_DIRECTORY) {
+            sftp_attributes_free(existing);
+            sftp_free(sftp);
+            ssh_disconnect(session);
+            ssh_free(session);
+            result.success = true;
+            result.alreadyExists = true;
+            result.message = QStringLiteral("Remote directory already exists.");
+            AppLogger::info(QStringLiteral("SFTP mkdir skipped existing directory: path=") + result.remotePath);
+            return result;
+        }
+
+        sftp_attributes_free(existing);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        result.success = false;
+        result.remoteTargetIsFile = true;
+        result.message = QStringLiteral("Remote path already exists and is not a directory.");
+        result.error = result.remotePath;
+        AppLogger::warn(QStringLiteral("SFTP mkdir target exists but is not directory: path=") + result.remotePath);
+        return result;
+    }
+
+    const int mkdirRc = sftp_mkdir(sftp, pathUtf8.constData(), 0755);
+
+    if (mkdirRc != SSH_OK) {
+        result.success = false;
+        result.message = QStringLiteral("Could not create remote directory.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP mkdir failed: path=") + result.remotePath
+            + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode)
+            + QStringLiteral(", error=") + result.error);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    sftp_free(sftp);
+    ssh_disconnect(session);
+    ssh_free(session);
+
+    result.success = true;
+    result.message = QStringLiteral("Remote directory created successfully.");
+    AppLogger::info(QStringLiteral("SFTP mkdir successful: path=") + result.remotePath);
+    return result;
+}
+
+
+SftpDeleteResult SftpProbe::deleteRemotePath(
+    const QString &host,
+    int port,
+    const QString &username,
+    SshAuthMethod authMethod,
+    const QString &secretValue,
+    const SshHostKeyExpectation &hostKeyExpectation,
+    const QString &remotePath
+)
+{
+    SftpDeleteResult result;
+    result.remotePath = remotePath.trimmed();
+
+    if (result.remotePath.isEmpty() || result.remotePath == QStringLiteral(".") || result.remotePath == QStringLiteral("..")) {
+        result.success = false;
+        result.message = QStringLiteral("Refusing to delete an empty/current/parent remote path.");
+        result.error = result.remotePath;
+        return result;
+    }
+
+    AppLogger::warn(QStringLiteral("SFTP remote delete started: host=") + host
+        + QStringLiteral(", port=") + QString::number(port)
+        + QStringLiteral(", user=") + username
+        + QStringLiteral(", path=") + result.remotePath);
+
+    ssh_session session = ssh_new();
+
+    if (session == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP delete failed before connect.");
+        result.error = QStringLiteral("ssh_new() failed: could not allocate SSH session.");
+        AppLogger::error(QStringLiteral("SFTP remote delete failed before connect: ssh_new failed"));
+        return result;
+    }
+
+    const QByteArray hostUtf8 = host.toUtf8();
+    const QByteArray usernameUtf8 = username.toUtf8();
+
+    int verbosity = SshCompatibility::defaultLogVerbosity();
+    long timeoutSeconds = 10;
+
+    ssh_options_set(session, SSH_OPTIONS_HOST, hostUtf8.constData());
+    ssh_options_set(session, SSH_OPTIONS_PORT, &port);
+    ssh_options_set(session, SSH_OPTIONS_USER, usernameUtf8.constData());
+    ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
+    ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeoutSeconds);
+    SshCompatibility::applySessionCompatibility(session);
+
+    const int connectRc = ssh_connect(session);
+
+    if (connectRc != SSH_OK) {
+        result.success = false;
+        result.message = QStringLiteral("SSH connect failed during SFTP delete.");
+        result.sshErrorCode = ssh_get_error_code(session);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP remote delete connect failed: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", error=") + result.error);
+        ssh_free(session);
+        return result;
+    }
+
+    if (!verifyConnectedServerHostKeyForDelete(session, hostKeyExpectation, &result)) {
+        AppLogger::error(QStringLiteral("SFTP remote delete host-key verification failed before auth: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", error=") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    if (!authenticateSessionForDelete(session, username, authMethod, secretValue, &result)) {
+        AppLogger::warn(QStringLiteral("SFTP remote delete authentication failed: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", message=") + result.message
+            + QStringLiteral(", error=") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    sftp_session sftp = sftp_new(session);
+
+    if (sftp == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("Could not allocate SFTP session for delete.");
+        result.sshErrorCode = ssh_get_error_code(session);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP remote delete allocation failed: ") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    const int initRc = sftp_init(sftp);
+
+    if (initRc != SSH_OK) {
+        result.success = false;
+        result.message = QStringLiteral("Could not initialize SFTP subsystem for delete.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP remote delete subsystem init failed: ") + result.error
+            + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode));
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    const QByteArray pathUtf8 = result.remotePath.toUtf8();
+    sftp_attributes attrs = sftp_lstat(sftp, pathUtf8.constData());
+
+    if (attrs == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("Remote path does not exist or cannot be inspected.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP remote delete lstat failed: path=") + result.remotePath
+            + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode)
+            + QStringLiteral(", error=") + result.error);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    const int remoteType = attrs->type;
+    sftp_attributes_free(attrs);
+
+    int deleteRc = SSH_ERROR;
+
+    if (remoteType == SSH_FILEXFER_TYPE_DIRECTORY) {
+        result.remotePathIsDirectory = true;
+        deleteRc = sftp_rmdir(sftp, pathUtf8.constData());
+    } else if (remoteType == SSH_FILEXFER_TYPE_REGULAR || remoteType == SSH_FILEXFER_TYPE_SYMLINK) {
+        deleteRc = sftp_unlink(sftp, pathUtf8.constData());
+    } else {
+        result.success = false;
+        result.message = QStringLiteral("Remote path is not a regular file, symlink, or empty directory. Delete skipped.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QStringLiteral("Unsupported remote file type.");
+        AppLogger::warn(QStringLiteral("SFTP remote delete skipped unsupported type: path=") + result.remotePath);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    if (deleteRc != SSH_OK) {
+        result.success = false;
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+
+        if (remoteType == SSH_FILEXFER_TYPE_DIRECTORY) {
+            result.blockedNonRecursiveDirectory = true;
+            result.message = QStringLiteral("Could not delete remote directory. It may be non-empty; recursive folder delete is not supported in this checkpoint.");
+        } else {
+            result.message = QStringLiteral("Could not delete remote file.");
+        }
+
+        AppLogger::error(QStringLiteral("SFTP remote delete failed: path=") + result.remotePath
+            + QStringLiteral(", directory=") + (remoteType == SSH_FILEXFER_TYPE_DIRECTORY ? QStringLiteral("true") : QStringLiteral("false"))
+            + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode)
+            + QStringLiteral(", error=") + result.error);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    sftp_free(sftp);
+    ssh_disconnect(session);
+    ssh_free(session);
+
+    result.success = true;
+    result.message = result.remotePathIsDirectory
+        ? QStringLiteral("Remote empty directory deleted successfully.")
+        : QStringLiteral("Remote file deleted successfully.");
+    AppLogger::warn(QStringLiteral("SFTP remote delete successful: path=") + result.remotePath
+        + QStringLiteral(", directory=") + (result.remotePathIsDirectory ? QStringLiteral("true") : QStringLiteral("false")));
+    return result;
+}
+
+SftpDownloadResult SftpProbe::downloadRemoteFile(
+    const QString &host,
+    int port,
+    const QString &username,
+    SshAuthMethod authMethod,
+    const QString &secretValue,
+    const SshHostKeyExpectation &hostKeyExpectation,
+    const QString &remotePath,
+    const QString &localPath,
+    SftpDownloadProgressCallback progressCallback
+)
+{
+    SftpDownloadResult result;
+    result.remotePath = remotePath.trimmed();
+    result.localPath = QDir::cleanPath(localPath.trimmed());
+
+    if (result.remotePath.isEmpty()) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP download failed before connect.");
+        result.error = QStringLiteral("Remote path is empty.");
+        return result;
+    }
+
+    if (result.localPath.isEmpty()) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP download failed before connect.");
+        result.error = QStringLiteral("Local target path is empty.");
+        return result;
+    }
+
+    const QFileInfo localInfo(result.localPath);
+    const QDir parentDir = localInfo.dir();
+
+    if (!parentDir.exists()) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP download failed before connect.");
+        result.error = QStringLiteral("Local destination folder does not exist: ") + parentDir.absolutePath();
+        return result;
+    }
+
+    AppLogger::info(QStringLiteral("SFTP file download started: host=") + host
+        + QStringLiteral(", port=") + QString::number(port)
+        + QStringLiteral(", user=") + username
+        + QStringLiteral(", remotePath=") + result.remotePath
+        + QStringLiteral(", localPath=") + result.localPath);
+
+    ssh_session session = ssh_new();
+
+    if (session == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP download failed before connect.");
+        result.error = QStringLiteral("ssh_new() failed: could not allocate SSH session.");
+        AppLogger::error(QStringLiteral("SFTP download failed before connect: ssh_new failed"));
+        return result;
+    }
+
+    const QByteArray hostUtf8 = host.toUtf8();
+    const QByteArray usernameUtf8 = username.toUtf8();
+
+    int verbosity = SshCompatibility::defaultLogVerbosity();
+    long timeoutSeconds = 10;
+
+    ssh_options_set(session, SSH_OPTIONS_HOST, hostUtf8.constData());
+    ssh_options_set(session, SSH_OPTIONS_PORT, &port);
+    ssh_options_set(session, SSH_OPTIONS_USER, usernameUtf8.constData());
+    ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
+    ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeoutSeconds);
+    SshCompatibility::applySessionCompatibility(session);
+
+    const int connectRc = ssh_connect(session);
+
+    if (connectRc != SSH_OK) {
+        result.success = false;
+        result.message = QStringLiteral("SSH connect failed during SFTP download.");
+        result.sshErrorCode = ssh_get_error_code(session);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP download connect failed: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", error=") + result.error);
+        ssh_free(session);
+        return result;
+    }
+
+    if (!verifyConnectedServerHostKeyForDownload(session, hostKeyExpectation, &result)) {
+        AppLogger::error(QStringLiteral("SFTP download host-key verification failed before auth: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", error=") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    if (hostKeyExpectation.enabled) {
+        AppLogger::info(QStringLiteral("SFTP download host-key verification OK: host=") + host
+            + QStringLiteral(", port=") + QString::number(port));
+    }
+
+    if (!authenticateSessionForDownload(session, username, authMethod, secretValue, &result)) {
+        AppLogger::warn(QStringLiteral("SFTP download authentication failed: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", message=") + result.message
+            + QStringLiteral(", error=") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    AppLogger::info(QStringLiteral("SFTP download authentication successful: host=") + host
+        + QStringLiteral(", port=") + QString::number(port));
+
+    sftp_session sftp = sftp_new(session);
+
+    if (sftp == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("Could not allocate SFTP session for download.");
+        result.sshErrorCode = ssh_get_error_code(session);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP download allocation failed: ") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    const int initRc = sftp_init(sftp);
+
+    if (initRc != SSH_OK) {
+        result.success = false;
+        result.message = QStringLiteral("Could not initialize SFTP subsystem for download.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP download subsystem init failed: ") + result.error
+            + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode));
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    const QByteArray remotePathUtf8 = result.remotePath.toUtf8();
+    sftp_attributes attributes = sftp_stat(sftp, remotePathUtf8.constData());
+
+    if (attributes == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("Could not stat remote file before SFTP download.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP download stat failed: remotePath=") + result.remotePath
+            + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode)
+            + QStringLiteral(", error=") + result.error);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    result.totalBytes = static_cast<quint64>(attributes->size);
+    const int remoteType = attributes->type;
+    sftp_attributes_free(attributes);
+
+    if (remoteType == SSH_FILEXFER_TYPE_DIRECTORY) {
+        result.success = false;
+        result.message = QStringLiteral("Selected remote path is a directory. Folder download is not implemented yet.");
+        result.error = QStringLiteral("Choose a single remote file for this checkpoint.");
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    sftp_file remoteFile = sftp_open(sftp, remotePathUtf8.constData(), O_RDONLY, 0);
+
+    if (remoteFile == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("Could not open remote file for SFTP download.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP download open failed: remotePath=") + result.remotePath
+            + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode)
+            + QStringLiteral(", error=") + result.error);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    QSaveFile localFile(result.localPath);
+
+    if (!localFile.open(QIODevice::WriteOnly)) {
+        result.success = false;
+        result.message = QStringLiteral("Could not open local file for SFTP download.");
+        result.error = localFile.errorString();
+        AppLogger::error(QStringLiteral("SFTP download local open failed: localPath=") + result.localPath
+            + QStringLiteral(", error=") + result.error);
+        sftp_close(remoteFile);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    if (progressCallback) {
+        if (!progressCallback(0, result.totalBytes, QStringLiteral("Starting download"))) {
+            result.cancelled = true;
+            result.success = false;
+            result.message = QStringLiteral("SFTP download cancelled before data transfer.");
+            localFile.cancelWriting();
+            sftp_close(remoteFile);
+            sftp_free(sftp);
+            ssh_disconnect(session);
+            ssh_free(session);
+            AppLogger::warn(QStringLiteral("SFTP download cancelled before transfer: remotePath=") + result.remotePath);
+            return result;
+        }
+    }
+
+    QByteArray buffer;
+    buffer.resize(64 * 1024);
+
+    while (true) {
+        const int readBytes = sftp_read(remoteFile, buffer.data(), buffer.size());
+
+        if (readBytes == 0) {
+            break;
+        }
+
+        if (readBytes < 0) {
+            result.success = false;
+            result.message = QStringLiteral("SFTP download failed while reading remote file.");
+            result.sftpErrorCode = sftp_get_error(sftp);
+            result.error = QString::fromUtf8(ssh_get_error(session));
+            AppLogger::error(QStringLiteral("SFTP download read failed: remotePath=") + result.remotePath
+                + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode)
+                + QStringLiteral(", error=") + result.error);
+            localFile.cancelWriting();
+            sftp_close(remoteFile);
+            sftp_free(sftp);
+            ssh_disconnect(session);
+            ssh_free(session);
+            return result;
+        }
+
+        const qint64 written = localFile.write(buffer.constData(), readBytes);
+
+        if (written != readBytes) {
+            result.success = false;
+            result.message = QStringLiteral("SFTP download failed while writing local file.");
+            result.error = localFile.errorString();
+            AppLogger::error(QStringLiteral("SFTP download local write failed: localPath=") + result.localPath
+                + QStringLiteral(", error=") + result.error);
+            localFile.cancelWriting();
+            sftp_close(remoteFile);
+            sftp_free(sftp);
+            ssh_disconnect(session);
+            ssh_free(session);
+            return result;
+        }
+
+        result.bytesTransferred += static_cast<quint64>(readBytes);
+
+        if (progressCallback) {
+            if (!progressCallback(result.bytesTransferred, result.totalBytes, QStringLiteral("Downloading"))) {
+                result.cancelled = true;
+                result.success = false;
+                result.message = QStringLiteral("SFTP download cancelled by user.");
+                localFile.cancelWriting();
+                sftp_close(remoteFile);
+                sftp_free(sftp);
+                ssh_disconnect(session);
+                ssh_free(session);
+                AppLogger::warn(QStringLiteral("SFTP download cancelled: remotePath=") + result.remotePath
+                    + QStringLiteral(", bytes=") + QString::number(result.bytesTransferred));
+                return result;
+            }
+        }
+    }
+
+    sftp_close(remoteFile);
+
+    if (!localFile.commit()) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP download failed while finalizing local file.");
+        result.error = localFile.errorString();
+        AppLogger::error(QStringLiteral("SFTP download local commit failed: localPath=") + result.localPath
+            + QStringLiteral(", error=") + result.error);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    sftp_free(sftp);
+    ssh_disconnect(session);
+    ssh_free(session);
+
+    result.success = true;
+    result.message = QStringLiteral("Remote file downloaded successfully.");
+
+    if (progressCallback) {
+        progressCallback(result.bytesTransferred, result.totalBytes, QStringLiteral("Download complete"));
+    }
+
+    AppLogger::info(QStringLiteral("SFTP file download successful: remotePath=") + result.remotePath
+        + QStringLiteral(", localPath=") + result.localPath
+        + QStringLiteral(", bytes=") + QString::number(result.bytesTransferred));
+
+    return result;
+}
+
+SftpUploadResult SftpProbe::uploadLocalFile(
+    const QString &host,
+    int port,
+    const QString &username,
+    SshAuthMethod authMethod,
+    const QString &secretValue,
+    const SshHostKeyExpectation &hostKeyExpectation,
+    const QString &localPath,
+    const QString &remotePath,
+    bool allowOverwrite,
+    SftpUploadProgressCallback progressCallback
+)
+{
+    SftpUploadResult result;
+    result.localPath = QDir::cleanPath(localPath.trimmed());
+    result.remotePath = remotePath.trimmed();
+
+    if (result.localPath.isEmpty()) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP upload failed before connect.");
+        result.error = QStringLiteral("Local source path is empty.");
+        return result;
+    }
+
+    if (result.remotePath.isEmpty()) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP upload failed before connect.");
+        result.error = QStringLiteral("Remote target path is empty.");
+        return result;
+    }
+
+    const QFileInfo localInfo(result.localPath);
+
+    if (!localInfo.exists()) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP upload failed before connect.");
+        result.error = QStringLiteral("Local source file does not exist: ") + result.localPath;
+        return result;
+    }
+
+    if (!localInfo.isFile()) {
+        result.success = false;
+        result.message = QStringLiteral("Selected local path is not a regular file. Folder upload is not implemented yet.");
+        result.error = QStringLiteral("Choose one local file for this checkpoint.");
+        return result;
+    }
+
+    result.totalBytes = static_cast<quint64>(localInfo.size());
+
+    AppLogger::info(QStringLiteral("SFTP upload preflight started: host=") + host
+        + QStringLiteral(", port=") + QString::number(port)
+        + QStringLiteral(", user=") + username
+        + QStringLiteral(", localPath=") + result.localPath
+        + QStringLiteral(", remotePath=") + result.remotePath
+        + QStringLiteral(", allowOverwrite=") + (allowOverwrite ? QStringLiteral("true") : QStringLiteral("false")));
+
+    ssh_session session = ssh_new();
+
+    if (session == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("SFTP upload failed before connect.");
+        result.error = QStringLiteral("ssh_new() failed: could not allocate SSH session.");
+        AppLogger::error(QStringLiteral("SFTP upload failed before connect: ssh_new failed"));
+        return result;
+    }
+
+    const QByteArray hostUtf8 = host.toUtf8();
+    const QByteArray usernameUtf8 = username.toUtf8();
+
+    int verbosity = SshCompatibility::defaultLogVerbosity();
+    long timeoutSeconds = 10;
+
+    ssh_options_set(session, SSH_OPTIONS_HOST, hostUtf8.constData());
+    ssh_options_set(session, SSH_OPTIONS_PORT, &port);
+    ssh_options_set(session, SSH_OPTIONS_USER, usernameUtf8.constData());
+    ssh_options_set(session, SSH_OPTIONS_LOG_VERBOSITY, &verbosity);
+    ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &timeoutSeconds);
+    SshCompatibility::applySessionCompatibility(session);
+
+    const int connectRc = ssh_connect(session);
+
+    if (connectRc != SSH_OK) {
+        result.success = false;
+        result.message = QStringLiteral("SSH connect failed during SFTP upload.");
+        result.sshErrorCode = ssh_get_error_code(session);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP upload connect failed: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", error=") + result.error);
+        ssh_free(session);
+        return result;
+    }
+
+    if (!verifyConnectedServerHostKeyForUpload(session, hostKeyExpectation, &result)) {
+        AppLogger::error(QStringLiteral("SFTP upload host-key verification failed before auth: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", error=") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    if (hostKeyExpectation.enabled) {
+        AppLogger::info(QStringLiteral("SFTP upload host-key verification OK: host=") + host
+            + QStringLiteral(", port=") + QString::number(port));
+    }
+
+    if (!authenticateSessionForUpload(session, username, authMethod, secretValue, &result)) {
+        AppLogger::warn(QStringLiteral("SFTP upload authentication failed: host=") + host
+            + QStringLiteral(", port=") + QString::number(port)
+            + QStringLiteral(", message=") + result.message
+            + QStringLiteral(", error=") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    AppLogger::info(QStringLiteral("SFTP upload authentication successful: host=") + host
+        + QStringLiteral(", port=") + QString::number(port));
+
+    sftp_session sftp = sftp_new(session);
+
+    if (sftp == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("Could not allocate SFTP session for upload.");
+        result.sshErrorCode = ssh_get_error_code(session);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP upload allocation failed: ") + result.error);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    const int initRc = sftp_init(sftp);
+
+    if (initRc != SSH_OK) {
+        result.success = false;
+        result.message = QStringLiteral("Could not initialize SFTP subsystem for upload.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP upload subsystem init failed: ") + result.error
+            + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode));
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    const QByteArray remotePathUtf8 = result.remotePath.toUtf8();
+    sftp_attributes remoteAttributes = sftp_stat(sftp, remotePathUtf8.constData());
+
+    if (remoteAttributes != nullptr) {
+        result.remoteAlreadyExists = true;
+        result.remoteTargetIsDirectory = remoteAttributes->type == SSH_FILEXFER_TYPE_DIRECTORY;
+        result.remoteExistingSizeBytes = static_cast<quint64>(remoteAttributes->size);
+        result.remoteExistingModifiedTime = timestampString(remoteAttributes->mtime);
+        sftp_attributes_free(remoteAttributes);
+
+        if (result.remoteTargetIsDirectory) {
+            result.success = false;
+            result.message = QStringLiteral("Remote target already exists and is a directory. Folder overwrite is not supported.");
+            result.error = QStringLiteral("Choose a different remote filename or remote folder.");
+            sftp_free(sftp);
+            ssh_disconnect(session);
+            ssh_free(session);
+            return result;
+        }
+
+        if (!allowOverwrite) {
+            result.success = false;
+            result.message = QStringLiteral("Remote target already exists. Overwrite was not approved.");
+            result.error = QStringLiteral("Remote file exists: ") + result.remotePath;
+            AppLogger::warn(QStringLiteral("SFTP upload target exists before transfer: remotePath=") + result.remotePath);
+            sftp_free(sftp);
+            ssh_disconnect(session);
+            ssh_free(session);
+            return result;
+        }
+    } else {
+        const int statError = sftp_get_error(sftp);
+        if (statError != SSH_FX_NO_SUCH_FILE) {
+            result.success = false;
+            result.message = QStringLiteral("Could not stat remote target before SFTP upload.");
+            result.sftpErrorCode = statError;
+            result.error = QString::fromUtf8(ssh_get_error(session));
+            AppLogger::error(QStringLiteral("SFTP upload remote stat failed: remotePath=") + result.remotePath
+                + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode)
+                + QStringLiteral(", error=") + result.error);
+            sftp_free(sftp);
+            ssh_disconnect(session);
+            ssh_free(session);
+            return result;
+        }
+    }
+
+    QFile localFile(result.localPath);
+
+    if (!localFile.open(QIODevice::ReadOnly)) {
+        result.success = false;
+        result.message = QStringLiteral("Could not open local file for SFTP upload.");
+        result.error = localFile.errorString();
+        AppLogger::error(QStringLiteral("SFTP upload local open failed: localPath=") + result.localPath
+            + QStringLiteral(", error=") + result.error);
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    AppLogger::info(QStringLiteral("SFTP file upload started: localPath=") + result.localPath
+        + QStringLiteral(", remotePath=") + result.remotePath
+        + QStringLiteral(", bytes=") + QString::number(result.totalBytes));
+
+    sftp_file remoteFile = sftp_open(sftp, remotePathUtf8.constData(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+
+    if (remoteFile == nullptr) {
+        result.success = false;
+        result.message = QStringLiteral("Could not open remote file for SFTP upload.");
+        result.sftpErrorCode = sftp_get_error(sftp);
+        result.error = QString::fromUtf8(ssh_get_error(session));
+        AppLogger::error(QStringLiteral("SFTP upload remote open failed: remotePath=") + result.remotePath
+            + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode)
+            + QStringLiteral(", error=") + result.error);
+        localFile.close();
+        sftp_free(sftp);
+        ssh_disconnect(session);
+        ssh_free(session);
+        return result;
+    }
+
+    if (progressCallback) {
+        if (!progressCallback(0, result.totalBytes, QStringLiteral("Starting upload"))) {
+            result.cancelled = true;
+            result.success = false;
+            result.message = QStringLiteral("SFTP upload cancelled before data transfer.");
+            sftp_close(remoteFile);
+            localFile.close();
+            sftp_free(sftp);
+            ssh_disconnect(session);
+            ssh_free(session);
+            AppLogger::warn(QStringLiteral("SFTP upload cancelled before transfer: localPath=") + result.localPath);
+            return result;
+        }
+    }
+
+    QByteArray buffer;
+    buffer.resize(64 * 1024);
+
+    while (true) {
+        const qint64 readBytes = localFile.read(buffer.data(), buffer.size());
+
+        if (readBytes == 0) {
+            break;
+        }
+
+        if (readBytes < 0) {
+            result.success = false;
+            result.message = QStringLiteral("SFTP upload failed while reading local file.");
+            result.error = localFile.errorString();
+            AppLogger::error(QStringLiteral("SFTP upload local read failed: localPath=") + result.localPath
+                + QStringLiteral(", error=") + result.error);
+            sftp_close(remoteFile);
+            localFile.close();
+            sftp_free(sftp);
+            ssh_disconnect(session);
+            ssh_free(session);
+            return result;
+        }
+
+        qint64 writtenTotal = 0;
+
+        while (writtenTotal < readBytes) {
+            const int written = sftp_write(
+                remoteFile,
+                buffer.constData() + writtenTotal,
+                static_cast<size_t>(readBytes - writtenTotal)
+            );
+
+            if (written < 0) {
+                result.success = false;
+                result.message = QStringLiteral("SFTP upload failed while writing remote file.");
+                result.sftpErrorCode = sftp_get_error(sftp);
+                result.error = QString::fromUtf8(ssh_get_error(session));
+                AppLogger::error(QStringLiteral("SFTP upload remote write failed: remotePath=") + result.remotePath
+                    + QStringLiteral(", sftpError=") + QString::number(result.sftpErrorCode)
+                    + QStringLiteral(", error=") + result.error);
+                sftp_close(remoteFile);
+                localFile.close();
+                sftp_free(sftp);
+                ssh_disconnect(session);
+                ssh_free(session);
+                return result;
+            }
+
+            if (written == 0) {
+                result.success = false;
+                result.message = QStringLiteral("SFTP upload failed while writing remote file.");
+                result.error = QStringLiteral("sftp_write() returned 0 bytes written before upload completed.");
+                AppLogger::error(QStringLiteral("SFTP upload remote write returned 0: remotePath=") + result.remotePath);
+                sftp_close(remoteFile);
+                localFile.close();
+                sftp_free(sftp);
+                ssh_disconnect(session);
+                ssh_free(session);
+                return result;
+            }
+
+            writtenTotal += written;
+            result.bytesTransferred += static_cast<quint64>(written);
+
+            if (progressCallback) {
+                if (!progressCallback(result.bytesTransferred, result.totalBytes, QStringLiteral("Uploading"))) {
+                    result.cancelled = true;
+                    result.success = false;
+                    result.message = QStringLiteral("SFTP upload cancelled by user. A partial remote file may remain.");
+                    sftp_close(remoteFile);
+                    localFile.close();
+                    sftp_free(sftp);
+                    ssh_disconnect(session);
+                    ssh_free(session);
+                    AppLogger::warn(QStringLiteral("SFTP upload cancelled: remotePath=") + result.remotePath
+                        + QStringLiteral(", bytes=") + QString::number(result.bytesTransferred));
+                    return result;
+                }
+            }
+        }
+    }
+
+    localFile.close();
+    sftp_close(remoteFile);
+    sftp_free(sftp);
+    ssh_disconnect(session);
+    ssh_free(session);
+
+    result.success = true;
+    result.message = QStringLiteral("Local file uploaded successfully.");
+
+    if (progressCallback) {
+        progressCallback(result.bytesTransferred, result.totalBytes, QStringLiteral("Upload complete"));
+    }
+
+    AppLogger::info(QStringLiteral("SFTP file upload successful: localPath=") + result.localPath
+        + QStringLiteral(", remotePath=") + result.remotePath
+        + QStringLiteral(", bytes=") + QString::number(result.bytesTransferred));
+
+    return result;
+}
+

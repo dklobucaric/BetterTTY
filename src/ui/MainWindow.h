@@ -1,0 +1,72 @@
+#pragma once
+
+#include <QMainWindow>
+#include <QPoint>
+#include <QString>
+#include <QStringList>
+#include <QtGlobal>
+
+class QCloseEvent;
+class QLabel;
+class QListWidget;
+class QTabWidget;
+class QTimer;
+class QToolBar;
+struct ConfigInspection;
+
+class MainWindow : public QMainWindow
+{
+public:
+    explicit MainWindow(QWidget *parent = nullptr);
+
+protected:
+    void closeEvent(QCloseEvent *event) override;
+
+private:
+    void setupMenus();
+    void setupToolbar();
+    void setupCentralLayout();
+    void loadSavedSessionsToSidebar();
+    void addWelcomeTab();
+    void applyAppTheme(const QString &themeName);
+    void applyQuickToolbarVisibility(bool showQuickToolbar);
+    void showConfigRecoveryWarningIfNeeded();
+    bool showConfigRecoveryDialog(const ConfigInspection &inspection);
+    void openConfigFolder();
+    void openLogFolder();
+    void setupTrafficStatusIndicator();
+    void updateTrafficStatusIndicator();
+    void updateLoggingStatusIndicator();
+    void exportConfig();
+    void importConfig();
+    void restoreLatestConfigBackup();
+    QStringList activeSshTerminalNames() const;
+    QStringList openSftpBrowserNames() const;
+    QStringList activeSftpTransferQueueSummaries() const;
+    bool confirmExitWithOpenConnectionTabs();
+    void requestDisconnectForActiveSshTerminals();
+    void showNewSessionDialog();
+    void showManualConnectDialog();
+    void showConnectDialog(bool newSavedSessionMode);
+    void showSettingsDialog();
+    void testSavedSession(const QString &sessionId);
+    void openSavedSessionShell(const QString &sessionId);
+    void openSavedSessionWebTerminal(const QString &sessionId);
+    void openSavedSessionShellInternal(const QString &sessionId, bool useWebTerminal);
+    void openSftpBrowserForSavedSession(const QString &sessionId);
+    void showSessionContextMenu(const QPoint &position);
+    void editSelectedSession();
+    void editSavedSession(const QString &sessionId);
+    void deleteSavedSession(const QString &sessionId);
+
+    QListWidget *m_sessionList = nullptr;
+    QTabWidget *m_tabs = nullptr;
+    QToolBar *m_mainToolBar = nullptr;
+    QLabel *m_loggingStatusLabel = nullptr;
+    QLabel *m_trafficStatusLabel = nullptr;
+    QTimer *m_trafficUpdateTimer = nullptr;
+    QWidget *m_lastTrafficWidget = nullptr;
+    qint64 m_lastTrafficReceivedBytes = 0;
+    qint64 m_lastTrafficSentBytes = 0;
+    qint64 m_lastTrafficUpdateMs = 0;
+};
