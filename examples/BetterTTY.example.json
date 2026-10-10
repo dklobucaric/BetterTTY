@@ -5,11 +5,14 @@
   },
   "settings": {
     "appearance": {
-      "app_theme": "system"
+      "app_theme": "light"
     },
     "terminal": {
       "font_family": "monospace",
-      "font_size": 14
+      "font_size": 14,
+      "show_paste_notifications": false,
+      "copy_on_select": true,
+      "paste_mode": "automatic"
     },
     "config_safety": {
       "backups_enabled": true,

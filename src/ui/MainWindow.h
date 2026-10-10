@@ -6,6 +6,7 @@
 #include <QStringList>
 #include <QtGlobal>
 
+class QAction;
 class QCloseEvent;
 class QLabel;
 class QListWidget;
@@ -26,6 +27,7 @@ private:
     void setupMenus();
     void setupToolbar();
     void setupCentralLayout();
+    void switchTab(int direction);
     void loadSavedSessionsToSidebar();
     void addWelcomeTab();
     void applyAppTheme(const QString &themeName);
@@ -61,6 +63,7 @@ private:
 
     QListWidget *m_sessionList = nullptr;
     QTabWidget *m_tabs = nullptr;
+    QAction *m_pasteAction = nullptr;
     QToolBar *m_mainToolBar = nullptr;
     QLabel *m_loggingStatusLabel = nullptr;
     QLabel *m_trafficStatusLabel = nullptr;

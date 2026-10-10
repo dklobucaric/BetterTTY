@@ -38,11 +38,14 @@ Windows and macOS use Qt's platform-specific application config location through
   },
   "settings": {
     "appearance": {
-      "app_theme": "system"
+      "app_theme": "light"
     },
     "terminal": {
       "font_family": "monospace",
-      "font_size": 14
+      "font_size": 14,
+      "show_paste_notifications": false,
+      "copy_on_select": true,
+      "paste_mode": "automatic"
     },
     "config_safety": {
       "backups_enabled": true,
@@ -99,30 +102,38 @@ Windows and macOS use Qt's platform-specific application config location through
 
 ```json
 "appearance": {
-  "app_theme": "system"
+  "app_theme": "light"
 }
 ```
 
 Supported values:
 
 ```text
-system
 light
 dark
 ```
 
-This currently affects the Qt application chrome only. The xterm.js terminal theme is intentionally unchanged.
+Default: `light`. Old or unknown values (including `system` from 1.0.0) load as `light`; `dark` is preserved. Opening a legacy config does not rewrite the file, but saving Settings persists the normalized theme. This affects the Qt UI only; the xterm.js terminal theme remains dark.
 
 ### Terminal
 
 ```json
 "terminal": {
   "font_family": "monospace",
-  "font_size": 14
+  "font_size": 14,
+  "show_paste_notifications": false,
+  "copy_on_select": true,
+  "paste_mode": "automatic"
 }
 ```
 
 Terminal font settings apply to newly opened xterm.js tabs.
+
+`paste_mode` is `"automatic"` by default (also for existing configs missing the key). Supported values: `"automatic"`, `"legacy"`, `"slow"`. Unknown values fall back safely to `"automatic"`. **Automatic** uses xterm.js's Bracketed Paste negotiation, **Legacy** sends plain CR-delimited input, and **Slow Paste** sends legacy input in timed chunks (50 ms). Unlike earlier behavior, pasting will not synthesize a final Enter. Changing the preference in Settings updates already-open terminals.
+
+`show_paste_notifications` is a boolean and defaults to `false`, **including for existing 1.0.0 configs that do not have this key**. When `false`, BetterTTY still pastes clipboard text into the remote shell but suppresses only the informational `Sent clipboard text to remote shell` message. When `true`, that confirmation appears as it did in 1.0.0. Saving Settings updates existing and new terminal tabs immediately.
+
+`copy_on_select` is a boolean and defaults to `true`, including older configs missing this key. When enabled, completing a mouse selection in an SSH terminal copies plain text to the standard system clipboard. When disabled, selecting text does not update the clipboard, but right-click Copy, toolbar Copy and Ctrl+Shift+C still work. Saving the setting updates existing tabs. Auto Copy replaces previous clipboard contents (including potentially sensitive values).
 
 ### Config safety
 

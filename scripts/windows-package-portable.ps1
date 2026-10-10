@@ -7,7 +7,7 @@ Usage:
   powershell -ExecutionPolicy Bypass -File scripts\windows-package-portable.ps1
 
 Optional overrides:
-  powershell -ExecutionPolicy Bypass -File scripts\windows-package-portable.ps1 -Version 1.0.0 -Arch x86_64
+  powershell -ExecutionPolicy Bypass -File scripts\windows-package-portable.ps1 -Version 1.0.2 -Arch x86_64
 #>
 
 param(
@@ -25,16 +25,16 @@ $projectRoot = Resolve-Path (Join-Path $scriptDir "..")
 function Get-ProjectVersion {
     $cmakeFile = Join-Path $projectRoot "CMakeLists.txt"
     if (-not (Test-Path $cmakeFile)) {
-        return "0.0.0"
+        throw "Cannot extract project(VERSION ...) from CMakeLists.txt."
     }
 
     $content = Get-Content -Path $cmakeFile -Raw
-    $match = [regex]::Match($content, 'set\s*\(\s*BETTERTTY_VERSION_STRING\s+"v?([0-9][^"]*)"')
+    $match = [regex]::Match($content, '(?m)^\s*VERSION\s+(\d+\.\d+\.\d+)\s*$')
     if ($match.Success) {
         return $match.Groups[1].Value
     }
 
-    return "0.0.0"
+    throw "Cannot extract project(VERSION ...) from CMakeLists.txt."
 }
 
 if ([string]::IsNullOrWhiteSpace($Version)) {

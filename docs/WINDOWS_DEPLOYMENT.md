@@ -1,5 +1,8 @@
 # Windows Standalone Deployment Test
 
+> **BetterTTY 1.0.2:** This document contains earlier build/release checkpoints and may show historical 1.0.0 examples. For the current 1.0.2 version, verified commands and release gates, start with [Build 1.0.2](BUILD_1.0.2.md) and [Release Status 1.0.2](RELEASE_STATUS_1.0.2.md). Do not copy historical version strings into new packages.
+
+
 **Checkpoint:** `1.0.0` — Andromeda
 **Purpose:** document the validated standalone Windows deployment folder that can run outside the build tree and without manually extending `PATH`.
 

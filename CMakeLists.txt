@@ -1,16 +1,47 @@
 cmake_minimum_required(VERSION 3.24)
 
 project(BetterTTY
-    VERSION 1.0.0
+    VERSION 1.0.2
     DESCRIPTION "A clean cross-platform SSH and SFTP client"
     HOMEPAGE_URL "https://bettertty.dev"
     LANGUAGES CXX
 )
 
-set(BETTERTTY_VERSION_STRING "1.0.0")
+# PROJECT_VERSION is the single numeric source of truth for app, Windows metadata,
+# macOS bundle and package helpers. Cross-platform release validation is tracked
+# separately; a version number alone does not certify a build.
+set(BETTERTTY_VERSION_STRING "${PROJECT_VERSION}")
 set(BETTERTTY_CODENAME_STRING "Andromeda")
-set(BETTERTTY_MILESTONE_STRING "Initial BetterTTY release")
+set(BETTERTTY_MILESTONE_STRING "Maintenance and usability update")
 set(BETTERTTY_BUNDLE_ID "hr.ddlab.bettertty")
+
+# If configured inside a Git checkout, expose a commit ID; source ZIPs are marked distinctly.
+set(BETTERTTY_BUILD_ID "source-archive")
+find_package(Git QUIET)
+if(Git_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --short=8 HEAD
+        WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+        OUTPUT_VARIABLE BETTERTTY_BUILD_ID
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+        RESULT_VARIABLE BETTERTTY_GIT_RESULT
+    )
+    if(NOT BETTERTTY_GIT_RESULT EQUAL 0 OR BETTERTTY_BUILD_ID STREQUAL "")
+        set(BETTERTTY_BUILD_ID "git-unknown")
+    else()
+        execute_process(
+            COMMAND "${GIT_EXECUTABLE}" status --porcelain
+            WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            OUTPUT_VARIABLE BETTERTTY_WORKTREE_STATUS
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(NOT BETTERTTY_WORKTREE_STATUS STREQUAL "")
+            string(APPEND BETTERTTY_BUILD_ID "-dirty")
+        endif()
+    endif()
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -85,11 +116,27 @@ qt_add_resources(bettertty "icon_assets"
         resources/icons/bettertty-256.png
         resources/icons/bettertty-512.png
         resources/icons/bettertty-1024.png
+        resources/icons/tab-close-dark.png
+        resources/icons/tab-close-light.png
+        resources/icons/checkbox-light-unchecked.png
+        resources/icons/checkbox-light-checked.png
+        resources/icons/checkbox-light-unchecked-disabled.png
+        resources/icons/checkbox-light-checked-disabled.png
+        resources/icons/checkbox-dark-unchecked.png
+        resources/icons/checkbox-dark-checked.png
+        resources/icons/checkbox-dark-unchecked-disabled.png
+        resources/icons/checkbox-dark-checked-disabled.png
 )
 
 if(WIN32)
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+    configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/resources/windows/bettertty.rc.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/bettertty.rc"
+        @ONLY
+    )
     target_sources(bettertty PRIVATE
-        resources/windows/bettertty.rc
+        "${CMAKE_CURRENT_BINARY_DIR}/generated/bettertty.rc"
     )
 endif()
 
@@ -112,6 +159,7 @@ target_compile_definitions(bettertty
         BETTERTTY_VERSION_STRING="${BETTERTTY_VERSION_STRING}"
         BETTERTTY_CODENAME_STRING="${BETTERTTY_CODENAME_STRING}"
         BETTERTTY_MILESTONE_STRING="${BETTERTTY_MILESTONE_STRING}"
+        BETTERTTY_BUILD_ID="${BETTERTTY_BUILD_ID}"
 )
 
 target_link_libraries(bettertty

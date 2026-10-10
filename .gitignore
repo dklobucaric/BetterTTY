@@ -59,3 +59,11 @@ desktop.ini
 # Logs and local diagnostics
 *.log
 diagnostics/
+
+# Credentials may be plaintext: never commit real BetterTTY config/backup files.
+BetterTTY.json
+BetterTTY.json.*
+*.pem
+*.key
+id_rsa
+id_ed25519

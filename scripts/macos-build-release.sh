@@ -8,7 +8,7 @@ BUILD_DIR="${BUILD_DIR:-${PROJECT_ROOT}/build-macos-release}"
 BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 GENERATOR="${CMAKE_GENERATOR:-Ninja}"
 QT_DIR="${QT_DIR:-${HOME}/Qt/6.11.1/macos}"
-MACOS_ARCH="${MACOS_ARCH:-x86_64}"
+MACOS_ARCH="${MACOS_ARCH:-$(uname -m)}"
 
 append_pkg_config_path() {
     local path="$1"

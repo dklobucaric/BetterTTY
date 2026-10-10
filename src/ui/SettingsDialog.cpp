@@ -42,7 +42,7 @@ QLabel *makeDescription(const QString &text, QWidget *parent)
     auto *label = new QLabel(text, parent);
     label->setWordWrap(true);
     label->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    label->setStyleSheet(QStringLiteral("color: palette(mid);"));
+    label->setObjectName(QStringLiteral("settingsDescription"));
     return label;
 }
 
@@ -126,7 +126,7 @@ QFrame *makeWarningBox(const QString &text, QWidget *parent)
     auto *label = new QLabel(text, frame);
     label->setWordWrap(true);
     label->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    label->setStyleSheet(QStringLiteral("color: #c98200;"));
+    label->setObjectName(QStringLiteral("settingsWarningText"));
     layout->addWidget(label);
 
     return frame;
@@ -141,6 +141,8 @@ SettingsDialog::SettingsDialog(
     : QDialog(parent)
     , m_configFilePath(configFilePath)
 {
+    // Theme-scoped checkbox indicators live in MainWindow's app stylesheets.
+    setObjectName(QStringLiteral("betterttySettingsDialog"));
     setWindowTitle(QStringLiteral("BetterTTY Settings"));
     setModal(true);
     setSizeGripEnabled(true);
@@ -309,15 +311,13 @@ SettingsDialog::SettingsDialog(
     int appearanceRow = 0;
 
     m_appThemeCombo = new QComboBox(appearanceGridWidget);
-    m_appThemeCombo->addItem(QStringLiteral("System default"), QStringLiteral("system"));
     m_appThemeCombo->addItem(QStringLiteral("Light"), QStringLiteral("light"));
     m_appThemeCombo->addItem(QStringLiteral("Dark"), QStringLiteral("dark"));
 
     const QString normalizedTheme = settings.appTheme.trimmed().toLower();
     const int themeIndex = m_appThemeCombo->findData(
-        (normalizedTheme == QStringLiteral("light") || normalizedTheme == QStringLiteral("dark"))
-            ? normalizedTheme
-            : QStringLiteral("system")
+        normalizedTheme == QStringLiteral("dark")
+            ? QStringLiteral("dark") : QStringLiteral("light")
     );
 
     if (themeIndex >= 0) {
@@ -330,7 +330,7 @@ SettingsDialog::SettingsDialog(
         QStringLiteral("App theme:"),
         m_appThemeCombo,
         QStringLiteral("Changes the Qt app chrome. The terminal renderer currently keeps its dark xterm.js theme."),
-        QStringLiteral("System default follows the operating system. Light and Dark force the BetterTTY application UI only.")
+        QStringLiteral("Light is the default. Dark uses a high-contrast dark interface. The terminal renderer keeps its own dark theme.")
     );
 
     appearanceLayout->addWidget(appearanceGridWidget);
@@ -376,6 +376,47 @@ SettingsDialog::SettingsDialog(
         m_terminalFontSizeSpin,
         QStringLiteral("Applies to newly opened xterm.js terminal tabs."),
         QStringLiteral("Terminal font size in points for new tabs.")
+    );
+
+    m_pasteModeCombo = new QComboBox(terminalGridWidget);
+    m_pasteModeCombo->addItem(QStringLiteral("Automatic (recommended)"), QStringLiteral("automatic"));
+    m_pasteModeCombo->addItem(QStringLiteral("Legacy (plain terminal input)"), QStringLiteral("legacy"));
+    m_pasteModeCombo->addItem(QStringLiteral("Slow Paste (compatibility)"), QStringLiteral("slow"));
+    const int pasteModeIndex = m_pasteModeCombo->findData(settings.pasteMode);
+    m_pasteModeCombo->setCurrentIndex(pasteModeIndex >= 0 ? pasteModeIndex : 0);
+    addSettingRow(
+        terminalGrid,
+        terminalRow,
+        QStringLiteral("Paste mode:"),
+        m_pasteModeCombo,
+        QStringLiteral("Automatic is the default. Slow Paste sends small chunks with 50 ms pauses."),
+        QStringLiteral("Automatic: xterm.js uses Bracketed Paste only if the remote app requests it. "
+                       "Legacy: send regular terminal input without markers. "
+                       "Slow Paste: pace regular input for compatibility; it does NOT prevent pasted newlines from acting as Enter.")
+    );
+
+    m_copyOnSelectCheck = new QCheckBox(QStringLiteral("Automatically copy selected text"), terminalGridWidget);
+    m_copyOnSelectCheck->setChecked(settings.copyOnSelect);
+    addSettingRow(
+        terminalGrid,
+        terminalRow,
+        QStringLiteral("Clipboard copy:"),
+        m_copyOnSelectCheck,
+        QStringLiteral("On by default. Copy terminal selections automatically when the mouse is released."),
+        QStringLiteral("Selecting text in an SSH terminal copies it into the system clipboard. "
+                       "Disable to require manual Copy. Right-click Copy, the Copy button and Ctrl+Shift+C "
+                       "always work regardless of this setting. Automatic copying replaces existing clipboard content.")
+    );
+
+    m_showPasteNotificationsCheck = new QCheckBox(QStringLiteral("Show paste notifications"), terminalGridWidget);
+    m_showPasteNotificationsCheck->setChecked(settings.showPasteNotifications);
+    addSettingRow(
+        terminalGrid,
+        terminalRow,
+        QStringLiteral("Paste notifications:"),
+        m_showPasteNotificationsCheck,
+        QStringLiteral("Off by default. Clipboard text is still pasted into the remote shell."),
+        QStringLiteral("Show a [BetterTTY] confirmation in the terminal after pasting clipboard text. Only the confirmation is hidden when disabled; errors and other status messages remain visible.")
     );
 
     terminalLayout->addWidget(terminalGridWidget);
@@ -487,7 +528,7 @@ SettingsDialog::SettingsDialog(
 AppSettings SettingsDialog::settings() const
 {
     AppSettings result;
-    result.appTheme = QStringLiteral("system");
+    result.appTheme = QStringLiteral("light");
 
     if (m_appThemeCombo != nullptr) {
         const QString selectedTheme = m_appThemeCombo->currentData().toString().trimmed();
@@ -500,6 +541,11 @@ AppSettings SettingsDialog::settings() const
         ? QStringLiteral("monospace")
         : m_terminalFontFamilyEdit->text().trimmed();
     result.terminalFontSize = m_terminalFontSizeSpin->value();
+    result.showPasteNotifications = (m_showPasteNotificationsCheck != nullptr) && m_showPasteNotificationsCheck->isChecked();
+    result.copyOnSelect = (m_copyOnSelectCheck != nullptr) && m_copyOnSelectCheck->isChecked();
+    result.pasteMode = m_pasteModeCombo != nullptr
+        ? m_pasteModeCombo->currentData().toString()
+        : QStringLiteral("automatic");
     result.showQuickToolbar = (m_showQuickToolbarCheck != nullptr) && m_showQuickToolbarCheck->isChecked();
     result.diagnosticLoggingEnabled = (m_diagnosticLoggingCheck != nullptr) && m_diagnosticLoggingCheck->isChecked();
     result.configBackupsEnabled = m_configBackupsCheck->isChecked();

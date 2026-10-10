@@ -18,12 +18,18 @@ public:
 public slots:
     void sendInput(const QString &input);
     void requestPaste();
+    void requestCopy();
+    void requestTabSwitch(int direction);
+    void autoCopySelection(const QString &selection);
     void terminalReady();
     void terminalResized(int columns, int rows);
 
 signals:
     void inputReceived(const QString &input);
     void pasteRequested();
+    void copyRequested();
+    void tabSwitchRequested(int direction);
+    void autoCopyRequested(const QString &selection);
     void ready();
     void resizeRequested(int columns, int rows);
     void outputBytesReceived(const QString &base64Output);

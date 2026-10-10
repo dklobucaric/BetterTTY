@@ -1,5 +1,8 @@
 # Building BetterTTY
 
+> **BetterTTY 1.0.2:** This document contains earlier build/release checkpoints and may show historical 1.0.0 examples. For the current 1.0.2 version, verified commands and release gates, start with [Build 1.0.2](BUILD_1.0.2.md) and [Release Status 1.0.2](RELEASE_STATUS_1.0.2.md). Do not copy historical version strings into new packages.
+
+
 BetterTTY is a Qt 6 / C++ / CMake / libssh project.
 
 ## Linux dependencies
@@ -130,7 +133,7 @@ The Qt app icon is embedded as a Qt resource and loaded from:
 Windows executable icon integration uses:
 
 ```text
-resources/windows/bettertty.rc
+resources/windows/bettertty.rc.in (template; CMake generates build-win-release/generated/bettertty.rc)
 resources/windows/bettertty.ico
 ```
 

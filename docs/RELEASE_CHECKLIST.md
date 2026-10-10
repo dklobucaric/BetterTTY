@@ -39,3 +39,16 @@
 - [ ] macOS `BetterTTY.app` launches on the intended test system.
 - [ ] macOS dependency audit is clean.
 - [ ] SHA-256 checksums are generated.
+
+## BetterTTY 1.0.2 release gate
+
+- [ ] Windows **1.0.2** build, About and PE properties match.
+- [ ] `.deb` reports package version `1.0.2`, installs, launches and removes on tested distro.
+- [ ] macOS `.app` and `.dmg` report 1.0.2, launch on actual target architecture, dependency audit clean.
+- [ ] Ctrl+Tab verified, Ctrl+Shift+Tab is not listed as supported.
+- [ ] All three Copy behaviors and three Paste modes tested with Settings persistence.
+- [ ] All screenshots reviewed/redacted and added only when available.
+- [ ] `plain-v1` human-readable credentials warning present in README and release notes.
+- [ ] Source and binaries contain NO real `BetterTTY.json`, backup files, passwords, private keys or logs.
+- [ ] `docs/RELEASE_STATUS_1.0.2.md` and `docs/QA_MATRIX_1.0.2.md` filled with tester evidence.
+- [ ] Final published tag, checksum files and install instructions use `1.0.2`.

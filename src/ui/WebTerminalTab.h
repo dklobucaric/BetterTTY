@@ -11,6 +11,7 @@ class QShowEvent;
 class QLabel;
 class QPushButton;
 class QThread;
+class QTimer;
 class QWebChannel;
 class QWebEngineView;
 class SshShellWorker;
@@ -36,10 +37,16 @@ public:
     qint64 receivedBytesTotal() const;
     qint64 sentBytesTotal() const;
     void requestDisconnect();
+    void setPasteNotificationsEnabled(bool enabled);
+    void setPasteMode(const QString &mode);
+    void setCopyOnSelectEnabled(bool enabled);
+    void pasteFromMenu();
+    void focusTerminal();
 
 signals:
     void tabTitleChanged(const QString &title);
     void lifecycleStatusChanged(const QString &status);
+    void tabSwitchRequested(int direction);
     void trafficCountersChanged();
 
 protected:
@@ -51,10 +58,12 @@ private:
     void startShell();
     void sendToWorker(const QString &input);
     void copySelection();
+    void autoCopySelection(const QString &selection);
     void pasteClipboard();
+    void sendNextSlowPasteChunk();
+    void cancelSlowPaste();
     void clearTerminal();
     void resetTerminal();
-    void focusTerminal();
     void disconnectShell();
     void reconnectShell();
     void setTerminalInputEnabled(bool enabled);
@@ -81,6 +90,11 @@ private:
     QPushButton *m_disconnectButton = nullptr;
 
     QThread *m_thread = nullptr;
+    QTimer *m_slowPasteTimer = nullptr;
+    QString m_pendingSlowPaste;
+    qsizetype m_slowPasteOffset = 0;
+    int m_slowPasteCharacters = 0;
+    int m_slowPasteLines = 0;
     SshShellWorker *m_worker = nullptr;
     int m_lastTerminalColumns = 0;
     int m_lastTerminalRows = 0;

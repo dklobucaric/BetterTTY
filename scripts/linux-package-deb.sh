@@ -10,7 +10,7 @@ detect_project_version() {
     local version=""
 
     if [[ -f "${cmake_file}" ]]; then
-        version="$(sed -nE 's/^[[:space:]]*set[[:space:]]*\([[:space:]]*BETTERTTY_VERSION_STRING[[:space:]]+"v?([0-9][^"]*)".*$/\1/p' "${cmake_file}" | head -n 1 || true)"
+        version="$(sed -nE '1,25s/^[[:space:]]*VERSION[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$/\1/p' "${cmake_file}" | head -n 1 || true)"
     fi
 
     if [[ -n "${version}" ]]; then
@@ -18,7 +18,8 @@ detect_project_version() {
         return 0
     fi
 
-    echo "0.0.0"
+    echo "ERROR: Could not extract project(VERSION ...) from CMakeLists.txt" >&2
+    return 1
 }
 PROJECT_VERSION="$(detect_project_version)"
 DEB_VERSION="${BETTERTTY_DEB_VERSION:-${PROJECT_VERSION}}"

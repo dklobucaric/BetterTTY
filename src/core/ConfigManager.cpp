@@ -1009,7 +1009,7 @@ void ConfigManager::ensureBaseObjects(QJsonObject *root) const
     QJsonObject appearanceSettings = settings.value(QStringLiteral("appearance")).toObject();
 
     if (!appearanceSettings.contains(QStringLiteral("app_theme"))) {
-        appearanceSettings.insert(QStringLiteral("app_theme"), QStringLiteral("system"));
+        appearanceSettings.insert(QStringLiteral("app_theme"), QStringLiteral("light"));
     }
 
     settings.insert(QStringLiteral("appearance"), appearanceSettings);
@@ -1022,6 +1022,17 @@ void ConfigManager::ensureBaseObjects(QJsonObject *root) const
 
     if (!terminalSettings.contains(QStringLiteral("font_size"))) {
         terminalSettings.insert(QStringLiteral("font_size"), 14);
+    }
+
+    if (!terminalSettings.contains(QStringLiteral("show_paste_notifications"))) {
+        terminalSettings.insert(QStringLiteral("show_paste_notifications"), false);
+    }
+    if (!terminalSettings.contains(QStringLiteral("copy_on_select"))) {
+        terminalSettings.insert(QStringLiteral("copy_on_select"), true);
+    }
+
+    if (!terminalSettings.contains(QStringLiteral("paste_mode"))) {
+        terminalSettings.insert(QStringLiteral("paste_mode"), QStringLiteral("automatic"));
     }
 
     settings.insert(QStringLiteral("terminal"), terminalSettings);
@@ -1236,16 +1247,23 @@ AppSettings ConfigManager::loadSettings(QString *errorMessage) const
     const QJsonObject diagnostics = settingsObject.value(QStringLiteral("diagnostics")).toObject();
     const QJsonObject behavior = settingsObject.value(QStringLiteral("behavior")).toObject();
 
-    const QString rawAppTheme = appearance.value(QStringLiteral("app_theme")).toString(QStringLiteral("system")).trimmed().toLower();
-    settings.appTheme = (rawAppTheme == QStringLiteral("light") || rawAppTheme == QStringLiteral("dark"))
-        ? rawAppTheme
-        : QStringLiteral("system");
+    const QString rawAppTheme = appearance.value(QStringLiteral("app_theme")).toString(QStringLiteral("light")).trimmed().toLower();
+    // Upgrade old "system" settings to Light in memory without rewriting the config.
+    settings.appTheme = rawAppTheme == QStringLiteral("dark")
+        ? QStringLiteral("dark") : QStringLiteral("light");
 
     const QString fontFamily = terminal.value(QStringLiteral("font_family")).toString(QStringLiteral("monospace")).trimmed();
     settings.terminalFontFamily = fontFamily.isEmpty()
         ? QStringLiteral("monospace")
         : fontFamily;
     settings.terminalFontSize = clampInt(terminal.value(QStringLiteral("font_size")).toInt(14), 8, 36);
+    settings.showPasteNotifications = terminal.value(QStringLiteral("show_paste_notifications")).toBool(false);
+    settings.copyOnSelect = terminal.value(QStringLiteral("copy_on_select")).toBool(true);
+    const QString pasteMode = terminal.value(QStringLiteral("paste_mode"))
+        .toString(QStringLiteral("automatic")).trimmed().toLower();
+    settings.pasteMode = (pasteMode == QStringLiteral("legacy") || pasteMode == QStringLiteral("slow"))
+        ? pasteMode
+        : QStringLiteral("automatic");
     settings.configBackupsEnabled = configSafety.value(QStringLiteral("backups_enabled")).toBool(true);
     settings.maxConfigBackups = clampInt(configSafety.value(QStringLiteral("max_backups")).toInt(10), 1, 50);
     settings.diagnosticLoggingEnabled = diagnostics.value(QStringLiteral("logging_enabled")).toBool(false);
@@ -1275,9 +1293,7 @@ bool ConfigManager::saveSettings(const AppSettings &settings, QString *errorMess
     const QString appTheme = settings.appTheme.trimmed().toLower();
     appearance.insert(
         QStringLiteral("app_theme"),
-        (appTheme == QStringLiteral("light") || appTheme == QStringLiteral("dark"))
-            ? appTheme
-            : QStringLiteral("system")
+        appTheme == QStringLiteral("dark") ? QStringLiteral("dark") : QStringLiteral("light")
     );
     settingsObject.insert(QStringLiteral("appearance"), appearance);
 
@@ -1287,6 +1303,13 @@ bool ConfigManager::saveSettings(const AppSettings &settings, QString *errorMess
         : settings.terminalFontFamily.trimmed();
     terminal.insert(QStringLiteral("font_family"), fontFamily);
     terminal.insert(QStringLiteral("font_size"), clampInt(settings.terminalFontSize, 8, 36));
+    terminal.insert(QStringLiteral("show_paste_notifications"), settings.showPasteNotifications);
+    terminal.insert(QStringLiteral("copy_on_select"), settings.copyOnSelect);
+    const QString pasteMode = settings.pasteMode.trimmed().toLower();
+    terminal.insert(QStringLiteral("paste_mode"),
+        (pasteMode == QStringLiteral("legacy") || pasteMode == QStringLiteral("slow"))
+            ? pasteMode
+            : QStringLiteral("automatic"));
     settingsObject.insert(QStringLiteral("terminal"), terminal);
 
     QJsonObject configSafety = settingsObject.value(QStringLiteral("config_safety")).toObject();

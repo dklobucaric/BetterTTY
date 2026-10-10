@@ -11,7 +11,10 @@ struct AppSettings
 {
     QString terminalFontFamily = QStringLiteral("monospace");
     int terminalFontSize = 14;
-    QString appTheme = QStringLiteral("system");
+    bool showPasteNotifications = false;
+    bool copyOnSelect = true; // FR-009: only automatic copy; manual Copy remains available
+    QString pasteMode = QStringLiteral("automatic"); // automatic, legacy, slow
+    QString appTheme = QStringLiteral("light");
     bool showQuickToolbar = false;
     bool diagnosticLoggingEnabled = false;
     bool configBackupsEnabled = true;

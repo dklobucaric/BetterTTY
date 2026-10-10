@@ -5,7 +5,7 @@ Guidelines for coding agents and contributors working on BetterTTY.
 ## Product identity
 
 - Product: **BetterTTY**
-- Version: **1.0.0**
+- Version: **1.0.1-dev** (unreleased development; last stable baseline **1.0.0**)
 - Codename: **Andromeda**
 - Tagline: **A better way to SSH.**
 - Secondary line: **Your servers. One dock.**

@@ -21,6 +21,8 @@
 
 ## Build and packaging
 
+- **[Build 1.0.2](BUILD_1.0.2.md)** — native builds and three platform packages
+
 - [Building](BUILDING.md)
 - [Windows Build](WINDOWS_BUILD.md)
 - [Windows Deployment](WINDOWS_DEPLOYMENT.md)
@@ -32,6 +34,11 @@
 - [Release Artifacts](RELEASE_ARTIFACTS.md)
 
 ## Release and validation
+
+- **[Release Notes 1.0.2](RELEASE_NOTES_1.0.2.md)** — current features and risks
+- **[Release Status 1.0.2](RELEASE_STATUS_1.0.2.md)** — platform verification gates
+- **[QA Matrix 1.0.2](QA_MATRIX_1.0.2.md)** — repeatable Windows/Linux/macOS tests
+- **[Screenshots](SCREENSHOTS.md)** — required source and release captures
 
 - [Release Notes 1.0](RELEASE_NOTES_1.0.md)
 - [Build and Test 1.0](BUILD_AND_TEST_1.0.md)

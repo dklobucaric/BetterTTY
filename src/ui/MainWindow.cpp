@@ -25,6 +25,7 @@
 #include <QListWidget>
 #include <QListWidgetItem>
 #include <QMenuBar>
+#include <QKeySequence>
 #include <QMessageBox>
 #include <QMenu>
 #include <QDir>
@@ -59,7 +60,7 @@ QString normalizedAppTheme(const QString &themeName)
         return normalized;
     }
 
-    return QStringLiteral("system");
+    return QStringLiteral("light");
 }
 
 QString formatTrafficBytes(qint64 bytes)
@@ -220,6 +221,9 @@ QPushButton:disabled {
     color: #8a8f98;
     background-color: #f1f3f5;
 }
+QLabel {
+    color: #111827;
+}
 QTabWidget::pane {
     border: 1px solid #cfd4dc;
 }
@@ -231,6 +235,38 @@ QTabBar::tab {
 }
 QTabBar::tab:selected {
     background-color: #ffffff;
+}
+QLabel#settingsDescription {
+    color: #667085;
+}
+QLabel#settingsWarningText {
+    color: #8D5500;
+}
+/* BUG-008: Settings checkboxes must remain visible on light Windows palettes.
+   Scope this to SettingsDialog so dialogs elsewhere retain their native controls. */
+QDialog#betterttySettingsDialog QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+}
+QDialog#betterttySettingsDialog QCheckBox::indicator:unchecked {
+    image: url(:/icons/checkbox-light-unchecked.png);
+}
+QDialog#betterttySettingsDialog QCheckBox::indicator:checked {
+    image: url(:/icons/checkbox-light-checked.png);
+}
+QDialog#betterttySettingsDialog QCheckBox::indicator:unchecked:disabled {
+    image: url(:/icons/checkbox-light-unchecked-disabled.png);
+}
+QDialog#betterttySettingsDialog QCheckBox::indicator:checked:disabled {
+    image: url(:/icons/checkbox-light-checked-disabled.png);
+}
+QTabBar::close-button {
+    image: url(:/icons/tab-close-dark.png);
+    width: 14px;
+    height: 14px;
+    subcontrol-position: right;
+    margin-left: 3px;
+    margin-right: 3px;
 }
 )BETTERTTY");
 }
@@ -271,7 +307,7 @@ QGroupBox::title {
     padding: 0 4px;
 }
 QLabel {
-    color: #e6edf3;
+    color: #FFFFFF;
 }
 QLineEdit,
 QSpinBox,
@@ -325,6 +361,37 @@ QTabBar::tab {
 QTabBar::tab:selected {
     background-color: #111827;
     color: #ffffff;
+}
+QLabel#settingsDescription {
+    color: #B8C0CC;
+}
+QLabel#settingsWarningText {
+    color: #FFC47A;
+}
+/* BUG-008: matching high-contrast checkbox states in Dark Settings. */
+QDialog#betterttySettingsDialog QCheckBox::indicator {
+    width: 18px;
+    height: 18px;
+}
+QDialog#betterttySettingsDialog QCheckBox::indicator:unchecked {
+    image: url(:/icons/checkbox-dark-unchecked.png);
+}
+QDialog#betterttySettingsDialog QCheckBox::indicator:checked {
+    image: url(:/icons/checkbox-dark-checked.png);
+}
+QDialog#betterttySettingsDialog QCheckBox::indicator:unchecked:disabled {
+    image: url(:/icons/checkbox-dark-unchecked-disabled.png);
+}
+QDialog#betterttySettingsDialog QCheckBox::indicator:checked:disabled {
+    image: url(:/icons/checkbox-dark-checked-disabled.png);
+}
+QTabBar::close-button {
+    image: url(:/icons/tab-close-light.png);
+    width: 14px;
+    height: 14px;
+    subcontrol-position: right;
+    margin-left: 3px;
+    margin-right: 3px;
 }
 )BETTERTTY");
 }
@@ -523,7 +590,7 @@ KnownHostDecisionResult promptKnownHostDecision(
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
 {
-    setWindowTitle("BetterTTY");
+    setWindowTitle(QStringLiteral("BetterTTY ") + QCoreApplication::applicationVersion());
 
     ConfigManager config;
     QString settingsError;
@@ -538,9 +605,10 @@ MainWindow::MainWindow(QWidget *parent)
         AppLogger::info(QStringLiteral("libssh: ") + SshSession::libsshVersion());
         AppLogger::info(QStringLiteral("Config file: ") + config.configFilePath());
         AppLogger::info(QStringLiteral("Log folder: ") + AppLogger::logDirectoryPath());
-        applyAppTheme(startupSettings.appTheme);
     }
 
+    // The UI theme must apply even if config loading failed (recovery UI).
+    applyAppTheme(startupSettings.appTheme);
     setupMenus();
     setupToolbar();
     applyQuickToolbarVisibility(startupSettings.showQuickToolbar);
@@ -563,12 +631,7 @@ void MainWindow::applyAppTheme(const QString &themeName)
         return;
     }
 
-    if (normalized == QStringLiteral("light")) {
-        qApp->setStyleSheet(lightAppStyleSheet());
-        return;
-    }
-
-    qApp->setStyleSheet(QString());
+    qApp->setStyleSheet(lightAppStyleSheet());
 }
 
 void MainWindow::applyQuickToolbarVisibility(bool showQuickToolbar)
@@ -1283,7 +1346,7 @@ bool MainWindow::showConfigRecoveryDialog(const ConfigInspection &inspection)
         }
 
         loadSavedSessionsToSidebar();
-        applyAppTheme(QStringLiteral("system"));
+        applyAppTheme(QStringLiteral("light"));
         applyQuickToolbarVisibility(false);
         QMessageBox::information(
             this,
@@ -1347,6 +1410,27 @@ void MainWindow::setupMenus()
         editSelectedSession();
     });
 
+    sessionMenu->addSeparator();
+    auto *nextTabAction = sessionMenu->addAction(QStringLiteral("Next Tab"));
+    nextTabAction->setShortcut(QKeySequence(QStringLiteral("Ctrl+Tab")));
+    nextTabAction->setShortcutContext(Qt::WindowShortcut);
+    connect(nextTabAction, &QAction::triggered, this, [this]() { switchTab(1); });
+
+
+    auto *editMenu = menuBar()->addMenu("&Edit");
+    m_pasteAction = editMenu->addAction(QStringLiteral("Paste"));
+    m_pasteAction->setToolTip(QStringLiteral("Paste into the active SSH terminal using Settings -> Terminal -> Paste mode."));
+    m_pasteAction->setEnabled(false);
+    // Do not assign Ctrl+Shift+V as a QAction shortcut: xterm.js intercepts
+    // that keyboard event and sends it through the same pasteClipboard() path.
+    connect(m_pasteAction, &QAction::triggered, this, [this]() {
+        if (m_tabs != nullptr) {
+            if (auto *terminal = qobject_cast<WebTerminalTab *>(m_tabs->currentWidget())) {
+                terminal->pasteFromMenu();
+            }
+        }
+    });
+
     auto *toolsMenu = menuBar()->addMenu("&Tools");
 
     auto *multiExecAction = toolsMenu->addAction("Multi-Exec");
@@ -1390,7 +1474,9 @@ void MainWindow::setupMenus()
             + QStringLiteral(BETTERTTY_CODENAME_STRING)
             + QStringLiteral("\nMilestone: ")
             + QStringLiteral(BETTERTTY_MILESTONE_STRING)
-            + QStringLiteral("\n\nDeveloper: DD-LAB\n")
+            + QStringLiteral("\nBuild: ")
+            + QStringLiteral(BETTERTTY_BUILD_ID)
+            + QStringLiteral("\nDeveloper: DD-LAB\n")
             + QStringLiteral("Copyright © 2026 Dalibor Klobučarić\n")
             + QStringLiteral("License: MIT\n")
             + QStringLiteral("Website: https://bettertty.dev\n\n")
@@ -1446,6 +1532,25 @@ void MainWindow::setupToolbar()
     });
 }
 
+void MainWindow::switchTab(int direction)
+{
+    if (m_tabs == nullptr || m_tabs->count() < 2 || (direction != 1 && direction != -1)) {
+        return;
+    }
+
+    const int count = m_tabs->count();
+    const int current = m_tabs->currentIndex();
+    if (current < 0) {
+        return;
+    }
+
+    m_tabs->setCurrentIndex((current + direction + count) % count);
+    if (auto *terminal = qobject_cast<WebTerminalTab *>(m_tabs->currentWidget())) {
+        // Restore SSH keyboard input after changing tabs from a WebEngine view.
+        QTimer::singleShot(0, terminal, [terminal]() { terminal->focusTerminal(); });
+    }
+}
+
 void MainWindow::setupCentralLayout()
 {
     auto *splitter = new QSplitter(Qt::Horizontal, this);
@@ -1474,6 +1579,9 @@ void MainWindow::setupCentralLayout()
     }
 
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int) {
+        if (m_pasteAction != nullptr) {
+            m_pasteAction->setEnabled(qobject_cast<WebTerminalTab *>(m_tabs->currentWidget()) != nullptr);
+        }
         m_lastTrafficWidget = nullptr;
         updateTrafficStatusIndicator();
     });
@@ -1612,10 +1720,24 @@ void MainWindow::addWelcomeTab()
     welcome->setFont(QFontDatabase::systemFont(QFontDatabase::FixedFont));
 
     welcome->setPlainText(
-        "BetterTTY 1.0 — Andromeda\n\n"
-        "A better way to SSH.\n"
-        "Your servers. One dock.\n\n"
-        "BetterTTY is a clean cross-platform SSH and SFTP client for managing saved servers, terminal sessions, and files.\n\n"
+        QStringLiteral("BetterTTY ") + QCoreApplication::applicationVersion()
+        + QStringLiteral(" — Andromeda\n\n")
+        + QStringLiteral("A better way to SSH.\n")
+        + QStringLiteral("Your servers. One dock.\n\n")
+        + QStringLiteral("What's New & Bugfixes (") + QCoreApplication::applicationVersion()
+        + QStringLiteral(")\n")
+        + QStringLiteral("- FR-001: Optional paste notifications (default OFF).\n")
+        + QStringLiteral("- BUG-003 / FR-003: Automatic, Legacy and Slow Paste modes for TUI compatibility.\n")
+        + QStringLiteral("- FR-004: Unified right-click, toolbar and keyboard Paste handling.\n")
+        + QStringLiteral("- BUG-005: Tab close buttons visible in Light and Dark themes.\n")
+        + QStringLiteral("- BUG-006: Readable settings labels and descriptions in both themes.\n")
+        + QStringLiteral("- FR-007: Light is the default; removed System theme option.\n")
+        + QStringLiteral("- BUG-008: High-contrast Settings checkboxes in Light and Dark.\n")
+        + QStringLiteral("- FR-009: Auto Copy on Selection (default ON; manual Copy always works).\n")
+        + QStringLiteral("- FR-010: Ctrl+Tab cycles through open BetterTTY tabs.\n")
+        + QStringLiteral("- FR-002: Consistent application version and build identification.\n\n")
+        + QStringLiteral("Platform release packages require separate testing on Windows, Linux and macOS.\n\n")
+        + QStringLiteral("BetterTTY is a clean cross-platform SSH and SFTP client for managing saved servers, terminal sessions, and files.\n\n"
         "Quick start:\n"
         "- Double-click a saved session to open the xterm.js SSH terminal.\n"
         "- Right-click a saved session and choose Open file manager for SFTP.\n"
@@ -1654,7 +1776,7 @@ void MainWindow::addWelcomeTab()
         "Website: https://bettertty.dev\n"
         "License: MIT\n"
         "Copyright © 2026 Dalibor Klobučarić\n"
-    );
+    ));
 
 
     m_tabs->addTab(welcome, "Welcome");
@@ -2305,6 +2427,12 @@ void MainWindow::openSavedSessionShellInternal(const QString &sessionId, bool us
     m_tabs->setCurrentIndex(tabIndex);
 
     if (auto *webTerminal = dynamic_cast<WebTerminalTab *>(terminal)) {
+        connect(webTerminal, &WebTerminalTab::tabSwitchRequested, this, [this, webTerminal](int direction) {
+            // Ignore asynchronous messages from a terminal that is no longer active.
+            if (m_tabs != nullptr && m_tabs->currentWidget() == webTerminal) {
+                switchTab(direction);
+            }
+        });
         connect(webTerminal, &WebTerminalTab::tabTitleChanged, this, [this, webTerminal](const QString &title) {
             const int index = m_tabs->indexOf(webTerminal);
 
@@ -2707,6 +2835,15 @@ void MainWindow::showSettingsDialog()
 
     applyAppTheme(newSettings.appTheme);
     applyQuickToolbarVisibility(newSettings.showQuickToolbar);
+    // Apply the paste-notification preference to terminals that are already open.
+    // Newly opened tabs load the same preference from BetterTTY.json.
+    for (int tabIndex = 0; tabIndex < m_tabs->count(); ++tabIndex) {
+        if (auto *terminal = qobject_cast<WebTerminalTab *>(m_tabs->widget(tabIndex))) {
+            terminal->setPasteNotificationsEnabled(newSettings.showPasteNotifications);
+            terminal->setPasteMode(newSettings.pasteMode);
+            terminal->setCopyOnSelectEnabled(newSettings.copyOnSelect);
+        }
+    }
     AppLogger::setEnabled(newSettings.diagnosticLoggingEnabled);
     updateLoggingStatusIndicator();
     AppLogger::info(QStringLiteral("Settings saved"));

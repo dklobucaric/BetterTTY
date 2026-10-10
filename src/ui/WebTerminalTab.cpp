@@ -4,6 +4,8 @@
 
 #include <QApplication>
 #include <QClipboard>
+#include <QContextMenuEvent>
+#include <QMenu>
 #include <QHBoxLayout>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -20,9 +22,31 @@
 #include <QWebEnginePage>
 #include <QWebEngineSettings>
 #include <QWebEngineView>
+#include <functional>
 
 
 namespace {
+// QWebEngineView's standard Chromium context menu is an editable-webview menu.
+// TerminalWebView replaces it with terminal-specific actions and preserves
+// Qt's normal keyboard/IME input path for everything else.
+class TerminalWebView final : public QWebEngineView
+{
+public:
+    using QWebEngineView::QWebEngineView;
+    std::function<void(const QPoint &)> showTerminalMenu;
+
+protected:
+    void contextMenuEvent(QContextMenuEvent *event) override
+    {
+        if (showTerminalMenu) {
+            showTerminalMenu(event->globalPos());
+            event->accept();
+            return;
+        }
+        QWebEngineView::contextMenuEvent(event);
+    }
+};
+
 QString javaScriptStringLiteral(const QString &value)
 {
     QJsonArray array;
@@ -64,7 +88,30 @@ WebTerminalTab::WebTerminalTab(
     m_statusLabel = new QLabel(QStringLiteral("State: preparing terminal engine | Target: ") + target, this);
     layout->addWidget(m_statusLabel);
 
-    m_view = new QWebEngineView(this);
+    auto *terminalView = new TerminalWebView(this);
+    m_view = terminalView;
+    terminalView->showTerminalMenu = [this](const QPoint &globalPos) {
+        QMenu menu(m_view);
+        QAction *copyAction = menu.addAction(QStringLiteral("Copy"));
+        connect(copyAction, &QAction::triggered, this, &WebTerminalTab::copySelection);
+
+        QAction *pasteAction = menu.addAction(QStringLiteral("Paste"));
+        pasteAction->setEnabled(m_shellActive && m_worker != nullptr);
+        connect(pasteAction, &QAction::triggered, this, &WebTerminalTab::pasteClipboard);
+
+        menu.addSeparator();
+        QAction *selectAllAction = menu.addAction(QStringLiteral("Select All"));
+        connect(selectAllAction, &QAction::triggered, this, [this]() {
+            if (m_view != nullptr && m_view->page() != nullptr) {
+                m_view->page()->runJavaScript(QStringLiteral(
+                    "window.betterttySelectAllTerminal && window.betterttySelectAllTerminal();"));
+            }
+        });
+
+        QAction *clearAction = menu.addAction(QStringLiteral("Clear Terminal"));
+        connect(clearAction, &QAction::triggered, this, &WebTerminalTab::clearTerminal);
+        menu.exec(globalPos);
+    };
     m_view->setFocusPolicy(Qt::StrongFocus);
     m_view->settings()->setAttribute(QWebEngineSettings::LocalContentCanAccessRemoteUrls, false);
     m_view->settings()->setAttribute(QWebEngineSettings::JavascriptEnabled, true);
@@ -77,7 +124,7 @@ WebTerminalTab::WebTerminalTab(
     buttonLayout->addWidget(m_interruptButton);
 
     m_pasteButton = new QPushButton(QStringLiteral("Paste"), this);
-    m_pasteButton->setToolTip(QStringLiteral("Paste clipboard text into the remote shell. Newlines are sent as Enter."));
+    m_pasteButton->setToolTip(QStringLiteral("Paste clipboard text using the selected Settings → Terminal → Paste mode."));
     buttonLayout->addWidget(m_pasteButton);
 
     m_clearButton = new QPushButton(QStringLiteral("Clear"), this);
@@ -104,6 +151,10 @@ WebTerminalTab::WebTerminalTab(
     buttonLayout->addStretch(1);
     layout->addLayout(buttonLayout);
 
+    m_slowPasteTimer = new QTimer(this);
+    m_slowPasteTimer->setInterval(50);
+    connect(m_slowPasteTimer, &QTimer::timeout, this, &WebTerminalTab::sendNextSlowPasteChunk);
+
     m_bridge = new TerminalBridge(this);
     m_channel = new QWebChannel(this);
     m_channel->registerObject(QStringLiteral("terminalBridge"), m_bridge);
@@ -118,6 +169,9 @@ WebTerminalTab::WebTerminalTab(
     connect(m_interruptButton, &QPushButton::clicked, this, &WebTerminalTab::copySelection);
     connect(m_pasteButton, &QPushButton::clicked, this, &WebTerminalTab::pasteClipboard);
     connect(m_bridge, &TerminalBridge::pasteRequested, this, &WebTerminalTab::pasteClipboard);
+    connect(m_bridge, &TerminalBridge::copyRequested, this, &WebTerminalTab::copySelection);
+    connect(m_bridge, &TerminalBridge::tabSwitchRequested, this, &WebTerminalTab::tabSwitchRequested);
+    connect(m_bridge, &TerminalBridge::autoCopyRequested, this, &WebTerminalTab::autoCopySelection);
     connect(m_clearButton, &QPushButton::clicked, this, &WebTerminalTab::clearTerminal);
     connect(m_resetButton, &QPushButton::clicked, this, &WebTerminalTab::resetTerminal);
     connect(m_focusButton, &QPushButton::clicked, this, &WebTerminalTab::focusTerminal);
@@ -160,9 +214,37 @@ WebTerminalTab::~WebTerminalTab()
 {
     disconnectShell();
 
+    cancelSlowPaste();
+
     if (m_thread != nullptr) {
         m_thread->quit();
         m_thread->wait(3000);
+    }
+}
+
+void WebTerminalTab::setPasteNotificationsEnabled(bool enabled)
+{
+    m_appSettings.showPasteNotifications = enabled;
+}
+
+void WebTerminalTab::setPasteMode(const QString &mode)
+{
+    const QString normalized = mode.trimmed().toLower();
+    m_appSettings.pasteMode = (normalized == QStringLiteral("legacy") || normalized == QStringLiteral("slow"))
+        ? normalized : QStringLiteral("automatic");
+    // A change to the paste policy must not leave an old slow paste running.
+    cancelSlowPaste();
+}
+
+void WebTerminalTab::setCopyOnSelectEnabled(bool enabled)
+{
+    m_appSettings.copyOnSelect = enabled;
+    // Already-open tabs pick up the changed preference without reconnecting.
+    if (m_view != nullptr && m_view->page() != nullptr) {
+        m_view->page()->runJavaScript(
+            QStringLiteral("window.betterttySetAutoCopyEnabled && window.betterttySetAutoCopyEnabled(%1);")
+                .arg(enabled ? QStringLiteral("true") : QStringLiteral("false"))
+        );
     }
 }
 
@@ -210,6 +292,9 @@ QString WebTerminalTab::targetLabel() const
 
 void WebTerminalTab::setConnectionUiState(const QString &state, bool remoteInputEnabled, bool reconnectAvailable)
 {
+    if (!remoteInputEnabled) {
+        cancelSlowPaste();
+    }
     const QString normalizedState = state.trimmed().isEmpty()
         ? QStringLiteral("unknown")
         : state.trimmed();
@@ -394,6 +479,8 @@ QString WebTerminalTab::terminalHtml() const
     let fitAddon = null;
     let usingXterm = false;
     let terminalInputEnabled = true;
+    let autoCopyEnabled = __AUTO_COPY_ON_SELECT__;
+    let selectingWithMouse = false;
     let rendererStatus = 'loading';
     let connectionState = 'starting';
     let outputDecoder = (typeof TextDecoder !== 'undefined') ? new TextDecoder('utf-8') : null;
@@ -403,8 +490,11 @@ QString WebTerminalTab::terminalHtml() const
 
     window.betterttyGetTerminalSelection = function () {
         try {
-            if (usingXterm && term && typeof term.hasSelection === 'function' && term.hasSelection()) {
-                return term.getSelection() || '';
+            if (usingXterm && term) {
+                // Do not fall back to stale browser text selection when the
+                // xterm.js terminal itself no longer has a selection.
+                return (typeof term.hasSelection === 'function' && term.hasSelection())
+                    ? (term.getSelection() || '') : '';
             }
 
             const selection = window.getSelection ? window.getSelection() : null;
@@ -417,6 +507,48 @@ QString WebTerminalTab::terminalHtml() const
 
         return '';
     };
+
+    window.betterttySetAutoCopyEnabled = function (enabled) {
+        autoCopyEnabled = !!enabled;
+    };
+
+    // Copy only after a real left-mouse selection is completed. Do not update
+    // the OS clipboard continuously while dragging the selection handles.
+    function beginMouseSelection(event) {
+        if (event.button === 0) {
+            selectingWithMouse = true;
+        }
+    }
+
+    function finishMouseSelection(event) {
+        if (!selectingWithMouse || event.button !== 0) {
+            return;
+        }
+        selectingWithMouse = false;
+        if (!autoCopyEnabled) {
+            return;
+        }
+        // xterm.js finalizes double/triple-click and drag selection in its own
+        // mouse handlers; sample at the end of this event turn.
+        setTimeout(function () {
+            if (!autoCopyEnabled || !bridge) {
+                return;
+            }
+            const selectedText = window.betterttyGetTerminalSelection();
+            if (selectedText) {
+                bridge.autoCopySelection(selectedText);
+            }
+        }, 0);
+    }
+
+    function installAutoCopyMouseHandlers(element) {
+        if (element) {
+            element.addEventListener('mousedown', beginMouseSelection, true);
+        }
+    }
+
+    // Mouse release can occur outside the xterm element after dragging.
+    document.addEventListener('mouseup', finishMouseSelection, true);
 
     function updateHeader() {
         const header = document.getElementById('header');
@@ -581,24 +713,6 @@ QString WebTerminalTab::terminalHtml() const
     }
 
 
-    function normalizePasteText(text) {
-        if (!text) {
-            return '';
-        }
-
-        let normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-
-        if (normalized.indexOf('\n') !== -1 && !normalized.endsWith('\n')) {
-            normalized += '\n';
-        }
-
-        // Terminal applications expect Enter/newline as carriage return (CR, ^M),
-        // not line feed (LF, ^J). Sending LF into full-screen apps such as nano
-        // can trigger commands like Justify Paragraph and destroy pasted YAML
-        // formatting. Keep internal normalization as LF, then convert for PTY input.
-        return normalized.replace(/\n/g, '\r');
-    }
-
     function isSafePasteShortcut(event) {
         if (!event || !event.key || event.altKey) {
             return false;
@@ -617,6 +731,48 @@ QString WebTerminalTab::terminalHtml() const
         }
 
         return false;
+    }
+
+    function isTerminalCopyShortcut(event) {
+        if (!event || !event.key || event.altKey || !event.shiftKey) {
+            return false;
+        }
+        const key = event.key.toLowerCase();
+        // Ctrl+Shift+C is always manual Copy; Command+Shift+C is also supported
+        // on macOS. Plain Ctrl+C continues to interrupt remote programs.
+        return key === 'c' && (
+            (event.ctrlKey && !event.metaKey) ||
+            (event.metaKey && !event.ctrlKey)
+        );
+    }
+
+    function handleTerminalTabShortcut(event) {
+        // The Chromium renderer may consume Ctrl+Tab before Qt's main-window
+        // QAction sees it. Intercept it in the capture phase as well.
+        if (!event || event.key !== 'Tab' || !event.ctrlKey || event.shiftKey || event.altKey || event.metaKey || !bridge) {
+            return;
+        }
+
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') {
+            event.stopImmediatePropagation();
+        }
+        bridge.requestTabSwitch(1);
+    }
+
+    function handleManualCopyShortcut(event) {
+        if (!isTerminalCopyShortcut(event)) {
+            return;
+        }
+        event.preventDefault();
+        event.stopPropagation();
+        if (typeof event.stopImmediatePropagation === 'function') {
+            event.stopImmediatePropagation();
+        }
+        if (bridge) {
+            bridge.requestCopy();
+        }
     }
 
     function requestSafePasteFromQt() {
@@ -655,21 +811,9 @@ QString WebTerminalTab::terminalHtml() const
         }
 
         element.addEventListener('paste', handleNativePasteEvent, true);
+        element.addEventListener('keydown', handleTerminalTabShortcut, true);
         element.addEventListener('keydown', handleSafePasteShortcut, true);
-    }
-
-    function stripBracketedPasteMarkers(data) {
-        if (!data) {
-            return '';
-        }
-
-        // Native/browser paste paths in xterm.js may wrap pasted text with
-        // bracketed-paste markers when the remote shell enabled bracketed
-        // paste mode. BetterTTY routes paste through Qt so large paste and
-        // clipboard handling are consistent across platforms; if raw markers
-        // still reach onData, strip only the wrapper markers before sending to
-        // the remote shell.
-        return data.replace(/\x1b\[200~/g, '').replace(/\x1b\[201~/g, '');
+        element.addEventListener('keydown', handleManualCopyShortcut, true);
     }
 
     function setupFallbackInput() {
@@ -723,17 +867,10 @@ QString WebTerminalTab::terminalHtml() const
             }
         });
 
-        fallbackTerminal.addEventListener('paste', function (event) {
-            event.preventDefault();
-            event.stopPropagation();
-
-            let text = event.clipboardData ? event.clipboardData.getData('text') : '';
-            text = normalizePasteText(text);
-
-            if (text) {
-                sendInput(text);
-            }
-        }, true);
+        // Route native clipboard events through Qt just like the toolbar and xterm.js.
+        installSafePasteHandlers(fallbackTerminal);
+        installSafePasteHandlers(document.body);
+        installAutoCopyMouseHandlers(fallbackTerminal);
 
         fallbackTerminal.addEventListener('mousedown', function () {
             fallbackTerminal.focus();
@@ -777,6 +914,7 @@ QString WebTerminalTab::terminalHtml() const
         }
 
         term.open(terminalHost);
+        installAutoCopyMouseHandlers(terminalHost);
         installSafePasteHandlers(terminalHost);
         installSafePasteHandlers(document.body);
         if (term.textarea) {
@@ -793,11 +931,9 @@ QString WebTerminalTab::terminalHtml() const
         term.writeln('');
 
         term.onData(function (data) {
-            const sanitizedData = stripBracketedPasteMarkers(data);
-
-            if (sanitizedData) {
-                sendInput(sanitizedData);
-            }
+            // Preserve Bracketed Paste delimiters produced by term.paste().
+            // Removing them would turn multiline TUI input into Enter presses.
+            sendInput(data);
         });
 
         terminalHost.addEventListener('mousedown', function () {
@@ -823,6 +959,22 @@ QString WebTerminalTab::terminalHtml() const
         setTimeout(function () { fitAndReport(); }, 750);
     }
 
+    window.betterttyPasteFromQt = function (text) {
+        if (!terminalInputEnabled || !bridge || !text) {
+            return;
+        }
+
+        if (usingXterm && term && typeof term.paste === 'function') {
+            // xterm.js tracks DECSET 2004 in the parser and wraps the paste
+            // in ESC[200~/ESC[201~ ONLY when the remote app has enabled it.
+            term.paste(text);
+            return;
+        }
+
+        // Renderer fallback: no xterm parser, so only conventional input works.
+        sendInput(text.replace(/\r?\n/g, '\r'));
+    };
+
     window.betterttySetTerminalInputEnabled = function (enabled) {
         terminalInputEnabled = !!enabled;
 
@@ -843,6 +995,25 @@ QString WebTerminalTab::terminalHtml() const
         }
 
         fallbackTerminal.focus();
+    };
+
+    window.betterttySelectAllTerminal = function () {
+        if (usingXterm && term) {
+            term.selectAll();
+            return;
+        }
+        // Fallback element may be editable/selectable depending on the renderer.
+        if (fallbackTerminal && typeof fallbackTerminal.select === 'function') {
+            fallbackTerminal.select();
+            return;
+        }
+        const selection = window.getSelection();
+        if (selection && fallbackTerminal) {
+            const range = document.createRange();
+            range.selectNodeContents(fallbackTerminal);
+            selection.removeAllRanges();
+            selection.addRange(range);
+        }
     };
 
     window.betterttyClearTerminal = function () {
@@ -904,7 +1075,9 @@ QString WebTerminalTab::terminalHtml() const
         .replace(QStringLiteral("__FONT_FAMILY_JS__"), javaScriptStringLiteral(m_appSettings.terminalFontFamily.trimmed().isEmpty()
             ? QStringLiteral("monospace")
             : m_appSettings.terminalFontFamily.trimmed()))
-        .replace(QStringLiteral("__FONT_SIZE__"), QString::number(m_appSettings.terminalFontSize));
+        .replace(QStringLiteral("__FONT_SIZE__"), QString::number(m_appSettings.terminalFontSize))
+        .replace(QStringLiteral("__AUTO_COPY_ON_SELECT__"), m_appSettings.copyOnSelect
+            ? QStringLiteral("true") : QStringLiteral("false"));
 }
 
 void WebTerminalTab::startShell()
@@ -1027,6 +1200,10 @@ void WebTerminalTab::sendToWorker(const QString &input)
         return;
     }
 
+    // Typing during a paced paste must cancel the remainder. This prevents
+    // an accidental interleaving of shell commands and lets Ctrl+C interrupt.
+    cancelSlowPaste();
+
     // SshShellWorker::sendInput is intentionally thread-safe and only appends
     // to a mutex-protected queue. Do not use a queued Qt call here: the worker
     // thread is busy running the SSH read/write loop, so queued slots may not
@@ -1068,6 +1245,77 @@ void WebTerminalTab::copySelection()
     );
 }
 
+void WebTerminalTab::autoCopySelection(const QString &selection)
+{
+    // The Qt-side gate protects the preference even if the renderer sends a
+    // stale selection event while Settings is being changed.
+    if (!m_appSettings.copyOnSelect || selection.isEmpty()) {
+        return;
+    }
+
+    QClipboard *clipboard = QApplication::clipboard();
+    if (clipboard != nullptr) {
+        clipboard->setText(selection, QClipboard::Clipboard);
+    }
+    // Silent by design: selecting logs must not inject status into the PTY.
+}
+
+void WebTerminalTab::cancelSlowPaste()
+{
+    if (m_slowPasteTimer != nullptr) {
+        m_slowPasteTimer->stop();
+    }
+    m_pendingSlowPaste.clear();
+    m_slowPasteOffset = 0;
+    m_slowPasteCharacters = 0;
+    m_slowPasteLines = 0;
+}
+
+void WebTerminalTab::sendNextSlowPasteChunk()
+{
+    if (!m_shellActive || m_worker == nullptr || m_pendingSlowPaste.isEmpty()) {
+        cancelSlowPaste();
+        return;
+    }
+
+    // One CR (Enter) at most per tick; long lines are split into bounded chunks.
+    // No additional final Enter is invented. Do not split UTF-16 surrogate pairs.
+    constexpr qsizetype maxChunkCharacters = 128;
+    const qsizetype textLength = m_pendingSlowPaste.size();
+    qsizetype end = qMin(m_slowPasteOffset + maxChunkCharacters, textLength);
+    const qsizetype nextEnter = m_pendingSlowPaste.indexOf(QChar('\r'), m_slowPasteOffset);
+    if (nextEnter >= 0 && nextEnter < end) {
+        end = nextEnter + 1;
+    } else if (end < textLength && end > m_slowPasteOffset
+               && m_pendingSlowPaste.at(end - 1).isHighSurrogate()) {
+        --end;
+    }
+
+    if (end <= m_slowPasteOffset) {
+        cancelSlowPaste();
+        return;
+    }
+
+    // Direct worker send avoids the normal input path's deliberate cancellation.
+    m_worker->sendInput(m_pendingSlowPaste.mid(m_slowPasteOffset, end - m_slowPasteOffset));
+    m_slowPasteOffset = end;
+    if (m_slowPasteOffset >= textLength) {
+        if (m_appSettings.showPasteNotifications && m_bridge != nullptr) {
+            m_bridge->emitStatus(
+                QStringLiteral("Sent clipboard text to remote shell (%1 chars, %2 line(s)).")
+                    .arg(m_slowPasteCharacters).arg(m_slowPasteLines)
+            );
+        }
+        cancelSlowPaste();
+    }
+}
+
+void WebTerminalTab::pasteFromMenu()
+{
+    // Unified entry point: menus, toolbar and keyboard ultimately use this.
+    pasteClipboard();
+}
+
 void WebTerminalTab::pasteClipboard()
 {
     if (!m_shellActive || m_worker == nullptr) {
@@ -1084,40 +1332,52 @@ void WebTerminalTab::pasteClipboard()
         if (m_bridge != nullptr) {
             m_bridge->emitStatus(QStringLiteral("Clipboard is empty. Nothing pasted."));
         }
-
         focusTerminal();
-
         return;
     }
 
     text.replace(QStringLiteral("\r\n"), QStringLiteral("\n"));
     text.replace(QChar('\r'), QChar('\n'));
+    const int characterCount = text.size();
+    const int lineCount = text.count(QChar('\n')) + (text.endsWith(QChar('\n')) ? 0 : 1);
 
-    const bool isMultiline = text.contains(QChar('\n'));
-    if (isMultiline && !text.endsWith(QChar('\n'))) {
-        text.append(QChar('\n'));
+    // Any previous paced paste is intentionally cancelled when a new one starts.
+    cancelSlowPaste();
+    if (m_appSettings.pasteMode == QStringLiteral("slow")) {
+        m_pendingSlowPaste = text;
+        m_pendingSlowPaste.replace(QChar('\n'), QChar('\r'));
+        m_slowPasteOffset = 0;
+        m_slowPasteCharacters = characterCount;
+        m_slowPasteLines = lineCount;
+        sendNextSlowPasteChunk();
+        if (!m_pendingSlowPaste.isEmpty()) {
+            m_slowPasteTimer->start();
+        }
+    } else if (m_appSettings.pasteMode == QStringLiteral("legacy")) {
+        // Legacy mode sends plain CR-delimited input, as if Enter were pressed
+        // between the copied lines; it does not append a trailing Enter.
+        text.replace(QChar('\n'), QChar('\r'));
+        sendToWorker(text);
+    } else {
+        // Automatic: use the bundled xterm.js parser to decide whether DECSET
+        // 2004 is active. term.paste() preserves the Bracketed Paste framing
+        // requested by full-screen apps (e.g. Hermes) and falls back to plain
+        // input for ordinary shells that do not enable it.
+        if (m_view != nullptr && m_view->page() != nullptr) {
+            m_view->page()->runJavaScript(
+                QStringLiteral("window.betterttyPasteFromQt && window.betterttyPasteFromQt(%1);")
+                    .arg(javaScriptStringLiteral(text))
+            );
+        }
     }
 
-    const int characterCount = text.size();
-    const int lineCount = isMultiline
-        ? text.count(QChar('\n'))
-        : 1;
-
-    // PTY/newline safety: terminal programs treat CR (^M) as Enter/newline.
-    // LF (^J) can be interpreted as an application command in full-screen
-    // editors, for example nano's Justify Paragraph. Preserve clipboard line
-    // structure for YAML/config pastes by converting normalized LF to CR only
-    // at the final terminal-input boundary.
-    QString terminalText = text;
-    terminalText.replace(QChar('\n'), QChar('\r'));
-
-    sendToWorker(terminalText);
-
-    if (m_bridge != nullptr) {
+    // Slow mode reports completion from the timer rather than claiming success
+    // before all chunks have entered the SSH worker queue.
+    if (m_appSettings.pasteMode != QStringLiteral("slow")
+        && m_appSettings.showPasteNotifications && m_bridge != nullptr) {
         m_bridge->emitStatus(
             QStringLiteral("Sent clipboard text to remote shell (%1 chars, %2 line(s)).")
-                .arg(characterCount)
-                .arg(lineCount)
+                .arg(characterCount).arg(lineCount)
         );
     }
 

@@ -25,6 +25,7 @@ BetterTTY 1.0.0 — Andromeda combines SSH session management, a real terminal, 
 - SSH PTY resize synchronization
 - terminal lifecycle and disconnect handling
 - Ctrl+C remote interrupt
+- Auto Copy on Selection (default On; optional, preserves right-click Copy and Ctrl+Shift+C) — in 1.0.1 development
 - toolbar, context-menu, keyboard, and macOS paste routing
 - multiline paste handling suitable for terminal editors and config files
 - tested full-screen applications including `htop`, `nano`, `vim`, `top`, and `clear`
@@ -56,6 +57,7 @@ BetterTTY 1.0.0 — Andromeda combines SSH session management, a real terminal, 
 - restore latest valid backup
 - theme selection
 - terminal font settings
+- selectable terminal paste modes: Automatic (negotiated Bracketed Paste), Legacy (plain CR), Slow Paste (paced chunks) — in 1.0.1 development
 - quick toolbar visibility
 - optional diagnostic logging
 

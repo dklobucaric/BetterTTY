@@ -15,6 +15,26 @@ void TerminalBridge::requestPaste()
     emit pasteRequested();
 }
 
+void TerminalBridge::requestCopy()
+{
+    emit copyRequested();
+}
+
+void TerminalBridge::requestTabSwitch(int direction)
+{
+    // Only the two supported navigation directions may leave the WebEngine.
+    if (direction == -1 || direction == 1) {
+        emit tabSwitchRequested(direction);
+    }
+}
+
+void TerminalBridge::autoCopySelection(const QString &selection)
+{
+    if (!selection.isEmpty()) {
+        emit autoCopyRequested(selection);
+    }
+}
+
 void TerminalBridge::terminalReady()
 {
     emit ready();
